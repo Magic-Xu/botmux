@@ -266,6 +266,10 @@ function grokTerminalOutcome(
   };
 }
 
+function activityPreview(text: string, maxChars: number): string {
+  return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+}
+
 /**
  * Increment-read updates.jsonl. Agent chunks of the CURRENT contiguous group
  * are buffered. A non-message event (tool_call / thought / hook) while a
@@ -422,7 +426,7 @@ export function drainGrokUpdates(
         events.push({
           uuid, timestampMs, kind: 'cot', text: '', sourceSessionId: sessionId,
           cotEntries: [{ kind: 'tool_call', id,
-            name: typeof update.title === 'string' ? update.title : 'tool', args,
+            name: typeof update.title === 'string' ? update.title : 'tool', args: activityPreview(args, 600),
             ...(subject ? { subject } : {}),
           }],
         });
@@ -434,7 +438,9 @@ export function drainGrokUpdates(
         const result = content || (output === undefined ? '' : typeof output === 'string' ? output : JSON.stringify(output));
         events.push({
           uuid, timestampMs, kind: 'cot', text: '', sourceSessionId: sessionId,
-          cotEntries: [{ kind: 'tool_result', id, result }],
+          // Match the existing Codex/Pi preview budget before IPC/storage.
+          // The shared accumulator checks its cap before appending an entry.
+          cotEntries: [{ kind: 'tool_result', id, result: activityPreview(result, 800) }],
         });
       }
     }

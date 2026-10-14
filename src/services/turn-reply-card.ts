@@ -25,7 +25,7 @@ export interface TurnReplyCardKey {
   dispatchAttempt?: number;
 }
 
-export type ReplyCardPhase = 'queued' | 'working' | 'waiting' | 'stopping' | 'completed' | 'failed' | 'cancelled' | 'ambiguous';
+export type ReplyCardPhase = 'queued' | 'working' | 'waiting' | 'stopping' | 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded';
 export interface ReplyCardTool { id: string; name: string; subject: string; completed?: boolean; result?: string }
 export type ReplyCardActivity =
   | { kind: 'thinking' | 'progress'; id: string; text: string }
@@ -70,11 +70,11 @@ export type TurnReplyCardEvent =
   | { kind: 'progress'; text: string }
   | { kind: 'final'; text: string; card: string; source: 'explicit' | 'bridge'; feedback?: TurnReplyCardRecord['feedback'] }
   | { kind: 'phase'; phase: 'working' | 'waiting' | 'stopping' }
-  | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous'; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
+  | { kind: 'terminal'; phase: 'completed' | 'failed' | 'cancelled' | 'ambiguous' | 'superseded'; durationMs?: number; completedAtMs?: number; disconnected?: boolean; orphanAskIds?: string[] }
   | { kind: 'refresh' };
 
 export function replyCardIsTerminal(record: Pick<TurnReplyCardRecord, 'phase'>): boolean {
-  return ['completed', 'failed', 'cancelled', 'ambiguous'].includes(record.phase);
+  return ['completed', 'failed', 'cancelled', 'ambiguous', 'superseded'].includes(record.phase);
 }
 
 export interface TurnReplyCardTransport {

@@ -18,6 +18,8 @@ import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { bindGroupContextDelivery, readGroupContextDeliveryBinding, writePreparedGroupContext } from '../src/services/group-context-delivery-store.js';
 import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 import MarkdownIt from 'markdown-it';
+import * as cotMessage from '../src/im/lark/cot-message.js';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 
 const topicDetailMock = vi.fn(async () => ({ items: [{ message_id: 'om_root', deleted: true }] }));
 const updateMessageMock = vi.fn(async () => {});
@@ -798,6 +800,88 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(getBotClient).not.toHaveBeenCalled();
     expect(sessionReply).not.toHaveBeenCalled();
     expect(ds.lastThinkingUpdate?.entries).toEqual([{ kind: 'text', text: 'Public progress' }]);
+  });
+
+  it.each([
+    ['grok', 'codex', false, false], ['codex', 'grok', false, true], ['grok', 'codex', true, true],
+  ] as const)('uses frozen %s instead of stale %s for legacy activity (forced=%s)', async (frozen, stale, forced, expected) => {
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = stale;
+    ds.session.cliLaunchSnapshot = {
+      version: 1, state: 'resolved', entryId: 'fixture', cliId: frozen, cliRuntime: null,
+      cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null, launchShell: null, startupCommands: [],
+    };
+    ds.currentTurnId = 'om_frozen_legacy';
+    ds.cotForced = forced;
+    getBot('app_test').config.replyCardMode = 'legacy';
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const handler = vi.spyOn(cotMessage, 'handleCotThinkingUpdate').mockReturnValue(true);
+    try {
+      ds.worker!.emit('message', { type: 'thinking_update', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+        entries: [{ kind: 'text', text: 'Public progress' }] });
+      await Promise.resolve();
+      expect(handler).toHaveBeenCalledTimes(expected ? 1 : 0);
+    } finally { handler.mockRestore(); }
+  });
+
+  it.each([false, true])('settles only the superseded Grok card before its successor finishes (activity=%s)', async activity => {
+    vi.useRealTimers();
+    getBot('app_test').config.replyCardMode = 'unified';
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'grok';
+    ds.currentTurnId = 'om_second';
+    ds.replyCardRunningTurnId = 'om_second';
+    let sent = 0;
+    const sessionReply = vi.fn(async () => `om_card_${++sent}`);
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const { updateTurnReplyCard } = await import('../src/core/turn-reply-card.js');
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const store = new TurnReplyCardStore(config.session.dataDir);
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_first' };
+    await updateTurnReplyCard(ds, 'om_first', { kind: 'start' }, sessionReply);
+    await updateTurnReplyCard(ds, 'om_second', { kind: 'start' }, sessionReply);
+    const secondBefore = store.read({ ...key, turnId: 'om_second' });
+    const queue = new CodexBridgeQueue(() => 10_000);
+    queue.setCotObserver((entries, turn) => ds.worker!.emit('message', {
+      type: 'thinking_update', sessionId: ds.session.sessionId, turnId: turn.turnId, entries,
+    }));
+    queue.setCotSupersededObserver(turn => ds.worker!.emit('message', {
+      type: 'thinking_superseded', sessionId: ds.session.sessionId, turnId: turn.turnId,
+    }));
+    queue.mark('om_first', 'first input', 10_000);
+    queue.mark('om_second', 'second input', 10_000);
+    queue.ingest([{ uuid: 'user1', timestampMs: 10_000, kind: 'user', text: 'first input' },
+      ...(activity ? [{ uuid: 'tool1', timestampMs: 10_001, kind: 'cot' as const, text: '',
+        cotEntries: [{ kind: 'tool_call' as const, id: 'read1', name: 'Read', args: '{}', subject: 'README.md' }] }] : []),
+      { uuid: 'user2', timestampMs: 10_002, kind: 'user', text: 'second input' },
+    ]);
+    await vi.waitFor(() => expect(store.read(key)?.phase).toBe('superseded'), { timeout: 3000 });
+    const first = store.read(key)!;
+    expect(first.lastCard).toContain('已由后续消息接续');
+    expect(first.lastCard).not.toContain('stop_turn');
+    expect(first.tools).toHaveLength(activity ? 1 : 0);
+    expect(store.read({ ...key, turnId: 'om_second' })).toEqual(secondBefore);
+    expect(ds.replyCardRunningTurnId).toBe('om_second');
+    expect(ds.worker!.send).not.toHaveBeenCalled();
+    expect(queue.drainEmittable()).toEqual([]);
+    ds.worker!.emit('message', { type: 'thinking_superseded', sessionId: 'wrong-session', turnId: 'om_second' });
+    ds.worker!.emit('message', { type: 'thinking_superseded', sessionId: ds.session.sessionId, turnId: 'om_second', dispatchAttempt: 99 });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(store.read({ ...key, turnId: 'om_second' })).toEqual(secondBefore);
+    expect(store.read({ ...key, turnId: 'om_second', dispatchAttempt: 99 })).toBeUndefined();
+    queue.ingest([{ uuid: 'final2', timestampMs: 10_003, kind: 'assistant_final', text: 'Merged answer.' }]);
+    const [final] = queue.drainEmittable();
+    expect(final.turnId).toBe('om_second');
+    ds.worker!.emit('message', { type: 'final_output', sessionId: ds.session.sessionId, turnId: final.turnId,
+      kind: 'bridge', content: final.finalText, lastUuid: 'merged-final' });
+    ds.worker!.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: final.turnId, status: 'completed' });
+    await vi.waitFor(() => expect(store.read({ ...key, turnId: 'om_second' })).toMatchObject({ phase: 'completed', finalText: 'Merged answer.' }));
+    expect(store.read(key)?.phase).toBe('superseded');
+    expect(sessionReply).toHaveBeenCalledTimes(2);
   });
 
   it.each([['claude-code', 'bridge'], ['claude-code', 'explicit'], ['grok', 'bridge'], ['grok', 'explicit']] as const)('keeps the %s %s answer and Oncall source in the existing reply card', async (cliId, source) => {

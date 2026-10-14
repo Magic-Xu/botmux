@@ -187,6 +187,27 @@ describe('drainGrokUpdates', () => {
     expect(result.events.some(e => e.kind === 'assistant_final')).toBe(false);
   });
 
+  it.each(['content', 'raw-string', 'raw-object'] as const)('bounds oversized %s tool output before it leaves the reader', source => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const large = 'x'.repeat(200_000);
+    const output = source === 'raw-object' ? { output: large } : large;
+    const path = writeUpdates(sid, '/tmp/proj', [userChunk(sid, 'inspect', 'user'),
+      { params: { sessionId: sid, update: { sessionUpdate: 'tool_call', toolCallId: 'read-large', title: 'Read', rawInput: { target_file: 'README.md', extra: large } } } },
+      { params: { sessionId: sid, update: { sessionUpdate: 'tool_call_update', toolCallId: 'read-large', status: 'completed',
+        ...(source === 'content' ? { content: [{ type: 'content', content: { type: 'text', text: large } }], rawOutput: 'unused fallback' } : { rawOutput: output }),
+      } } }, agentChunk(sid, 'Full final answer.', 'final'), turnDone(sid, 'done'),
+    ]);
+    const events = drainGrokUpdates(path, 0, { includePublicActivity: true }).events;
+    const entries = events.flatMap(e => e.cotEntries ?? []);
+    const call = entries.find(e => e.kind === 'tool_call');
+    const result = entries.find(e => e.kind === 'tool_result');
+    expect(call).toMatchObject({ kind: 'tool_call', subject: 'README.md' });
+    expect(call?.kind === 'tool_call' && call.args.length).toBeLessThanOrEqual(601);
+    const original = source === 'raw-object' ? JSON.stringify(output) : large;
+    expect(result).toEqual({ kind: 'tool_result', id: 'read-large', result: `${original.slice(0, 800)}…` });
+    expect(events.at(-1)).toMatchObject({ kind: 'assistant_final', text: 'Full final answer.' });
+  });
+
   it('attributes public activity once to the matching native turn without settling on a tool', () => {
     const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
     const path = writeUpdates(sid, '/tmp/proj', [userChunk(sid, 'inspect', 'user'), agentChunk(sid, 'Checking.', 'a'), toolCall(sid, 'tool')]);
@@ -208,6 +229,24 @@ describe('drainGrokUpdates', () => {
     expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_test', finalText: 'Done.' }]);
     queue.ingest([{ ...events[1], uuid: 'after-final' }]);
     expect(seen).toHaveLength(2);
+  });
+
+  it('retires a merged Grok input without manufacturing an earlier final', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'first request', 'u1'),
+      userChunk(sid, 'follow-up', 'u2', 1_000_050),
+      agentChunk(sid, 'Combined answer.', 'final'), turnDone(sid, 'done'),
+    ]);
+    const queue = new CodexBridgeQueue();
+    const superseded: string[] = [];
+    queue.setCotSupersededObserver(turn => superseded.push(turn.turnId));
+    queue.mark('om_first', 'first request', 100);
+    queue.mark('om_second', 'follow-up', 200);
+    queue.ingest(drainGrokUpdates(path, 0, { includePublicActivity: true }).events);
+    expect(superseded).toEqual(['om_first']);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_second', finalText: 'Combined answer.' }]);
+    expect(queue.drainEmittable()).toEqual([]);
   });
 
   it('emits user + assistant_final for a completed turn', () => {

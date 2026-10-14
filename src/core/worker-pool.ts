@@ -111,7 +111,7 @@ import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
-import { replyCardModeFor, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards } from './turn-reply-card.js';
+import { replyCardModeFor, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
 import { readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
@@ -15025,6 +15025,11 @@ function setupWorkerHandlers(
         if (!ownsLifecycleMutation()) break;
         if (msg.sessionId !== ds.session.sessionId) break;
         handleCotThinkingSuperseded(ds, msg);
+        if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          void supersedeTurnReplyCard(ds, msg,
+            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
+            ownsLifecycleMutation).catch(error => logger.warn(`[${t}] reply-card superseded: ${error.message}`));
+        }
         break;
       }
 
@@ -15047,7 +15052,7 @@ function setupWorkerHandlers(
         }
         // Grok public activity is enabled for dynamic replies. Preserve its
         // legacy message layout unless the user explicitly requests /cot show.
-        if ((ds.session.cliId ?? getBot(ds.larkAppId).config.cliId) !== 'grok' || ds.cotForced) {
+        if (effectiveCliId !== 'grok' || ds.cotForced) {
           handleCotThinkingUpdate(ds, msg);
         }
         break;

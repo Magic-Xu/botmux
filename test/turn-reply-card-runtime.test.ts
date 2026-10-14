@@ -1,11 +1,11 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DaemonSession } from '../src/core/types.js';
 import { config } from '../src/config.js';
 import { getBot } from '../src/bot-registry.js';
-import { replyCardModeFor, updateTurnReplyCard, settleTurnReplyCards, queueTurnReplyTools, flushTurnReplyTools } from '../src/core/turn-reply-card.js';
+import { replyCardModeFor, updateTurnReplyCard, settleTurnReplyCards, supersedeTurnReplyCard, sweepInterruptedReplyCards, queueTurnReplyTools, flushTurnReplyTools } from '../src/core/turn-reply-card.js';
 import { MessageWithdrawnError, updateMessage } from '../src/im/lark/client.js';
 import { observePublishedGroupMessage } from '../src/services/group-context-runtime.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
@@ -48,7 +48,7 @@ describe('reply-card runtime eligibility and recovery', () => {
   });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
-  it.each(['completed', 'failed', 'cancelled'] as const)('settles Grok as %s and isolates later turns', async phase => {
+  it.each(['completed', 'failed', 'cancelled', 'superseded'] as const)('settles Grok as %s and isolates later turns', async phase => {
     const ds = session();
     ds.session.cliId = 'grok';
     let sends = 0;
@@ -73,6 +73,52 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(store.read(key)?.phase).toBe(phase);
     expect(store.read({ ...key, turnId: 'om_next' })).toEqual(nextBefore);
     expect(nextBefore).toMatchObject({ phase: 'working', messageId: 'om_reply_2' });
+  });
+
+  it.each([['grok', 'gemini', 'unified'], ['gemini', 'grok', 'legacy']] as const)(
+    'uses frozen %s rather than stale %s for reply-card admission', (frozen, stale, expected) => {
+      const ds = session();
+      ds.session.cliId = stale;
+      ds.session.cliLaunchSnapshot = {
+        version: 1, state: 'resolved', entryId: 'fixture', cliId: frozen, cliRuntime: null,
+        cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null, launchShell: null, startupCommands: [],
+      };
+      expect(replyCardModeFor(ds)).toBe(expected);
+    },
+  );
+
+  it('preserves a superseded card across disconnect and startup recovery', async () => {
+    const ds = session();
+    ds.session.cliId = 'grok';
+    const send = vi.fn(async () => 'om_reply');
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'superseded' }, send);
+    const store = new TurnReplyCardStore(dir);
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+    const record = store.read(key)!;
+    // Simulate a persisted card from before this daemon started.
+    record.createdAtMs = record.updatedAtMs = 1;
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(record));
+    vi.mocked(updateMessage).mockClear();
+    await settleTurnReplyCards(ds);
+    await sweepInterruptedReplyCards(ds.larkAppId);
+    expect(store.read(key)).toEqual(record);
+    expect(updateMessage).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])('retires only a visible persisted final-only card on supersede (visible=%s)', async visible => {
+    const ds = session();
+    ds.session.cliId = 'grok';
+    new TurnReplyCardStore(dir).prepareSync({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' }, {
+      mode: 'final-only', chatId: ds.chatId, rootId: ds.session.rootMessageId,
+    });
+    const send = vi.fn(async () => 'om_reply');
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send, { forceVisible: visible });
+    await supersedeTurnReplyCard(ds, { turnId: 'om_mode' }, send, () => true);
+    expect(send).toHaveBeenCalledTimes(visible ? 1 : 0);
+    if (visible) expect(vi.mocked(updateMessage).mock.calls.at(-1)?.[2]).toContain('已由后续消息接续');
+    else expect(updateMessage).not.toHaveBeenCalled();
   });
 
   it.each([false, true])('private replies bypass dynamic cards with an existing reservation=%s', async reserved => {
