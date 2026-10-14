@@ -7556,7 +7556,7 @@ function structuredBridgeIngestPath(
     ompBridgeState = result.state;
     return result;
   }
-  if (structuredBridgeIsGrok()) return drainGrokUpdates(path, offset);
+  if (structuredBridgeIsGrok()) return drainGrokUpdates(path, offset, { includePublicActivity: true });
   if (structuredBridgeIsHermes()) {
     const result = drainHermesStateDb(offset, currentHermesBridgeDbPath());
     return { events: result.events, newOffset: result.newOffset, pendingTail: '' };

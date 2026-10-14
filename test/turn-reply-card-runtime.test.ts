@@ -48,6 +48,33 @@ describe('reply-card runtime eligibility and recovery', () => {
   });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
+  it.each(['completed', 'failed', 'cancelled'] as const)('settles Grok as %s and isolates later turns', async phase => {
+    const ds = session();
+    ds.session.cliId = 'grok';
+    let sends = 0;
+    const send = vi.fn(async () => `om_reply_${++sends}`);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    queueTurnReplyTools(ds, { turnId: 'om_mode', entries: [
+      { kind: 'text', text: 'Inspecting the project.' },
+      { kind: 'tool_call', id: 'read', name: 'Read', args: '{}', subject: 'README.md' },
+      { kind: 'tool_result', id: 'read', result: 'Project documentation' },
+    ] }, send, () => true);
+    await flushTurnReplyTools(ds, 'om_mode');
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase }, send);
+    const store = new TurnReplyCardStore(dir);
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+    expect(store.read(key)).toMatchObject({ phase, messageId: 'om_reply_1' });
+    expect(store.read(key)?.tools).toHaveLength(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(updateMessage).mock.calls.every(call => call[1] === 'om_reply_1')).toBe(true);
+    await updateTurnReplyCard(ds, 'om_next', { kind: 'start' }, send);
+    const nextBefore = store.read({ ...key, turnId: 'om_next' });
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'tools', tools: [], activity: [] }, send);
+    expect(store.read(key)?.phase).toBe(phase);
+    expect(store.read({ ...key, turnId: 'om_next' })).toEqual(nextBefore);
+    expect(nextBefore).toMatchObject({ phase: 'working', messageId: 'om_reply_2' });
+  });
+
   it.each([false, true])('private replies bypass dynamic cards with an existing reservation=%s', async reserved => {
     const ds = session();
     Object.assign(ds.session, { larkAppId: ds.larkAppId, chatType: 'group', scope: 'thread' });
@@ -181,7 +208,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(patched).toContain('README.md');
   });
 
-  it.each(['claude-code', 'codex'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
+  it.each(['claude-code', 'codex', 'grok'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     ds.session.sandbox = true;
@@ -295,7 +322,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' })?.durationMs).toBe(2500);
   });
 
-  it.each(['claude-code', 'codex'] as const)('keeps %s live narration when queued snapshots end in tool calls', async cliId => {
+  it.each(['claude-code', 'codex', 'grok'] as const)('keeps %s live narration when queued snapshots end in tool calls', async cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     const send = vi.fn(async (_body: string) => 'om_reply');

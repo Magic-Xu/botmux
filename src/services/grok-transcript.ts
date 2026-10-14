@@ -20,7 +20,9 @@
  * user-visible closing paragraph. This also keeps the 1s poller from rewinding across
  * long tool stretches (hundreds of tool_call_update lines).
  *
- * Mid-turn thoughts / tool calls are ignored so the queue never closes a
+ * Public narration and tools can additionally emit cosmetic `cot` events
+ * when includePublicActivity is enabled. Thoughts and hook payloads stay local.
+ * These events never close a turn, so the queue never closes a
  * Lark turn on narration. Type-ahead follow-ups park until the active turn
  * finishes (Grok queue semantics ≈ CoCo), so the transcript stays interleaved
  * user1 → assistant_final1 → user2 → assistant_final2 — CodexBridgeQueue's
@@ -31,6 +33,7 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { CodexBridgeEvent, CodexDrainResult } from './codex-transcript.js';
+import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
 import {
   encodeGrokCwd, grokSessionsRoot, grokUpdatesPath, grokSummaryPath,
   resolveGrokCwdBucketDir,
@@ -272,9 +275,12 @@ function grokTerminalOutcome(
  * terminal `assistant_final` event, with whatever group is still buffered as
  * its (possibly empty) text. If the file ends mid-group, newOffset
  * rewinds to the group's first chunk so the next poll re-reads it (queue
- * dedups by uuid).
+ * dedups by uuid). includePublicActivity preserves consumed narration and
+ * tool events in a separate cosmetic channel without changing final selection.
  */
-export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainResult {
+export function drainGrokUpdates(
+  path: string, fromOffset: number, options: { includePublicActivity?: boolean } = {},
+): GrokDrainResult {
   if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
   let size: number;
   try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
@@ -396,6 +402,44 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
       continue;
     }
 
+    // Public narration belongs to the process timeline, never the final.
+    // Use the group's first byte offset so re-reading an incomplete tail
+    // preserves the bridge queue's event deduplication identity.
+    if (options.includePublicActivity && agentParts.length > 0) {
+      events.push({
+        uuid: `${path}:${openTurnStartOffset}:narration`, timestampMs,
+        kind: 'cot', text: '', sourceSessionId: openTurnSessionId ?? sessionId,
+        cotEntries: [{ kind: 'text', text: agentParts.join('') }],
+      });
+    }
+    if (options.includePublicActivity && typeof update.toolCallId === 'string' && update.toolCallId) {
+      const id = update.toolCallId;
+      if (su === 'tool_call') {
+        const input = update.rawInput;
+        const args = input === undefined ? '' : typeof input === 'string' ? input : JSON.stringify(input);
+        const subject = boundSubjectForTransport(subjectFromInputObject(input)
+          || (typeof input?.target_file === 'string' ? input.target_file : ''));
+        events.push({
+          uuid, timestampMs, kind: 'cot', text: '', sourceSessionId: sessionId,
+          cotEntries: [{ kind: 'tool_call', id,
+            name: typeof update.title === 'string' ? update.title : 'tool', args,
+            ...(subject ? { subject } : {}),
+          }],
+        });
+      } else if (su === 'tool_call_update' && ['completed', 'failed'].includes(update.status)) {
+        const content = Array.isArray(update.content) ? update.content
+          .filter((item: any) => item?.type === 'content' && item.content?.type === 'text')
+          .map((item: any) => contentText(item.content)).join('\n') : '';
+        const output = update.rawOutput;
+        const result = content || (output === undefined ? '' : typeof output === 'string' ? output : JSON.stringify(output));
+        events.push({
+          uuid, timestampMs, kind: 'cot', text: '', sourceSessionId: sessionId,
+          cotEntries: [{ kind: 'tool_result', id, result }],
+        });
+      }
+    }
+    // Do not publish agent_thought_chunk or hook payloads. Only public
+    // assistant narration and tool activity enter the reply card.
     // tool_call / thought / hooks / etc. — any buffered agent group is
     // mid-turn narration and can never be the final answer. Drop it and
     // advance past this line so the 1s poller does not rewind through

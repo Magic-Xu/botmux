@@ -165,7 +165,7 @@ import {
 import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
 import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
-import { getBot, getOwnerOpenId, resolveReplyDelivery, resolveUsageDisplay } from '../src/bot-registry.js';
+import { getBot, getBotClient, getOwnerOpenId, resolveReplyDelivery, resolveUsageDisplay } from '../src/bot-registry.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import {
   clearMessageListenerRunPreviewStore,
@@ -782,7 +782,25 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.worker?.kill).not.toHaveBeenCalled();
   });
 
-  it.each(['bridge', 'explicit'] as const)('keeps the %s answer and Oncall source in the existing reply card', async source => {
+  it('keeps Grok legacy activity from creating an extra native process message', async () => {
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'grok';
+    ds.currentTurnId = 'om_grok_legacy';
+    const sessionReply = vi.fn(async () => 'om_unexpected');
+    getBot('app_test').config.replyCardMode = 'legacy';
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    vi.mocked(getBotClient).mockClear();
+    ds.worker!.emit('message', { type: 'thinking_update', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      entries: [{ kind: 'text', text: 'Public progress' }] });
+    await Promise.resolve();
+    expect(getBotClient).not.toHaveBeenCalled();
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastThinkingUpdate?.entries).toEqual([{ kind: 'text', text: 'Public progress' }]);
+  });
+
+  it.each([['claude-code', 'bridge'], ['claude-code', 'explicit'], ['grok', 'bridge'], ['grok', 'explicit']] as const)('keeps the %s %s answer and Oncall source in the existing reply card', async (cliId, source) => {
     vi.useRealTimers();
     const bot = getBot('app_test');
     bot.config.replyCardMode = 'unified';
@@ -791,7 +809,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const ds = makeDs();
     ds.adoptedFrom = undefined;
     ds.scope = 'thread';
-    ds.session.cliId = 'claude-code';
+    ds.session.cliId = cliId;
     ds.currentTurnId = 'om_managed_turn';
     const sessionReply = vi.fn(async () => 'om_managed_reply');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
@@ -832,6 +850,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   it.each([
     ['claude-code', 'on'], ['claude-code', 'bot-off'], ['claude-code', 'chat-off'],
     ['codex', 'on'], ['codex', 'bot-off'], ['codex', 'chat-off'],
+    ['grok', 'on'], ['grok', 'bot-off'], ['grok', 'chat-off'],
   ] as const)('%s unified replies keep the %s status card independent through ready and final output', async (cliId, statusMode) => {
     vi.useRealTimers();
     const bot = getBot('app_test');

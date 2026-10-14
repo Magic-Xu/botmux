@@ -67,7 +67,7 @@ export function replyCardModeFor(ds: DaemonSession, turnId = ds.currentTurnId): 
   const cli = ds.session.cliId ?? cfg.cliId;
   const existing = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, turnId));
   let mode: TurnReplyCardMode = existing?.mode ?? normalizeReplyCardMode(cfg.replyCardMode);
-  if (!turnId.startsWith('om_') || !ds.chatId.startsWith('oc_') || !['claude-code', 'codex'].includes(cli)
+  if (!turnId.startsWith('om_') || !ds.chatId.startsWith('oc_') || !['claude-code', 'codex', 'grok'].includes(cli)
     || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: cfg.apiOnly })
     || isDocNativeSession(ds) || ds.session.vcMeetingReceiver || ds.session.deferredScheduleRun
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.session.headless

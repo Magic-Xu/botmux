@@ -8,6 +8,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import {
   drainGrokUpdates,
   matchGrokPromptAppend,
@@ -126,6 +127,87 @@ describe('drainGrokUpdates', () => {
   afterEach(() => {
     rmSync(ROOT, { recursive: true, force: true });
     delete process.env.GROK_HOME;
+  });
+
+  it('emits public narration and completed tools without making them final or exposing thoughts', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const call = toolCall(sid, 'read');
+    Object.assign(call.params.update, { rawInput: { target_file: 'README.md' } });
+    const event = (update: object) => ({ params: { sessionId: sid, update } });
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'inspect the project', 'user'),
+      agentChunk(sid, 'Reading ', 'a1'), agentChunk(sid, 'the README.', 'a2'),
+      event({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'private reasoning' } }),
+      call,
+      event({ sessionUpdate: 'tool_call_update', toolCallId: 'call-read', title: 'Read', rawInput: { target_file: 'README.md' } }),
+      event({ sessionUpdate: 'tool_call_update', toolCallId: 'call-read', status: 'in_progress', rawOutput: 'partial' }),
+      event({ sessionUpdate: 'tool_call_update', toolCallId: 'call-read', status: 'completed',
+        content: [{ type: 'content', content: { type: 'text', text: 'Project documentation' } }], rawOutput: { internal: 'not shown' } }),
+      agentChunk(sid, 'Final summary.', 'final'), turnDone(sid, 'done'),
+    ]);
+    const legacy = drainGrokUpdates(path, 0);
+    expect(legacy.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    const result = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    expect(result.events.map(e => e.kind)).toEqual(['user', 'cot', 'cot', 'cot', 'assistant_final']);
+    expect(result.events.filter(e => e.kind === 'cot').flatMap(e => e.cotEntries ?? [])).toEqual([
+      { kind: 'text', text: 'Reading the README.' },
+      { kind: 'tool_call', id: 'call-read', name: 'run_terminal_command', args: '{"target_file":"README.md"}', subject: 'README.md' },
+      { kind: 'tool_result', id: 'call-read', result: 'Project documentation' },
+    ]);
+    expect(result.events.at(-1)).toEqual(legacy.events.at(-1));
+    expect(result.events.every(e => e.sourceSessionId === sid)).toBe(true);
+    expect(JSON.stringify(result.events)).not.toContain('private reasoning');
+    expect(JSON.stringify(result.events)).not.toContain('partial');
+    expect(JSON.stringify(result.events)).not.toContain('not shown');
+  });
+
+  it('retains stable narration identities across partial polls and consumes tool activity only once', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [userChunk(sid, 'inspect', 'user'), agentChunk(sid, 'Checking.', 'a')]);
+    const first = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    expect(first.events.map(e => e.kind)).toEqual(['user']);
+    appendFileSync(path, JSON.stringify(toolCall(sid, 'tool')) + '\n');
+    const next = drainGrokUpdates(path, first.newOffset, { includePublicActivity: true });
+    expect(next.events.map(e => e.kind)).toEqual(['cot', 'cot']);
+    expect(next.events).toEqual(drainGrokUpdates(path, first.newOffset, { includePublicActivity: true }).events);
+    expect(drainGrokUpdates(path, next.newOffset, { includePublicActivity: true }).events).toEqual([]);
+    appendFileSync(path, JSON.stringify(agentChunk(sid, 'Done.', 'f')) + '\n' + JSON.stringify(turnDone(sid, 'done')) + '\n');
+    const final = drainGrokUpdates(path, next.newOffset, { includePublicActivity: true });
+    expect(final.events).toHaveLength(1);
+    expect(final.events[0]).toMatchObject({ kind: 'assistant_final', text: 'Done.', terminalStatus: 'completed' });
+  });
+
+  it('preserves failed tool output without converting it into a turn terminal', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [userChunk(sid, 'run a check', 'user'), toolCall(sid, 'tool'),
+      { params: { sessionId: sid, update: { sessionUpdate: 'tool_call_update', toolCallId: 'call-tool', status: 'failed', rawOutput: { error: 'command failed' } } } },
+    ]);
+    const result = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    expect(result.events.at(-1)).toMatchObject({ kind: 'cot', cotEntries: [{ kind: 'tool_result', id: 'call-tool', result: '{"error":"command failed"}' }] });
+    expect(result.events.some(e => e.kind === 'assistant_final')).toBe(false);
+  });
+
+  it('attributes public activity once to the matching native turn without settling on a tool', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [userChunk(sid, 'inspect', 'user'), agentChunk(sid, 'Checking.', 'a'), toolCall(sid, 'tool')]);
+    const events = drainGrokUpdates(path, 0, { includePublicActivity: true }).events;
+    const queue = new CodexBridgeQueue();
+    const seen: string[] = [];
+    queue.setCotObserver((_entries, turn) => seen.push(turn.turnId));
+    queue.ingest(events.filter(e => e.kind === 'cot').map(e => ({ ...e, uuid: `history:${e.uuid}` })));
+    expect(seen).toEqual([]);
+    queue.mark('om_test', 'inspect', 100);
+    queue.ingest(events);
+    queue.ingest(events);
+    expect(seen).toEqual(['om_test', 'om_test']);
+    expect(queue.drainEmittable()).toEqual([]);
+    queue.ingest([{ ...events[1], uuid: 'wrong-session', sourceSessionId: 'another-native-session' }]);
+    expect(seen).toHaveLength(2);
+    appendFileSync(path, JSON.stringify(agentChunk(sid, 'Done.', 'f')) + '\n' + JSON.stringify(turnDone(sid, 'done')) + '\n');
+    queue.ingest(drainGrokUpdates(path, 0, { includePublicActivity: true }).events);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_test', finalText: 'Done.' }]);
+    queue.ingest([{ ...events[1], uuid: 'after-final' }]);
+    expect(seen).toHaveLength(2);
   });
 
   it('emits user + assistant_final for a completed turn', () => {
