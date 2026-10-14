@@ -584,6 +584,7 @@ export interface CommandHandlerDeps {
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
   prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
+  submitQueuedMessage?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
   /** Immutable Lark placement captured by the daemon for this slash-command
    * invocation. Unlike session state, it remains valid after close/replace. */
   invocationReplyTarget?: FrozenSessionReplyTarget;
@@ -1151,10 +1152,18 @@ async function applyAllowedUsersSet(
   if (!r.ok) {
     if (r.reason === 'self_lockout') { await reply(t('cmd.config.allow_lockout', undefined, loc)); return; }
     if (r.reason === 'empty_resolved') { await reply(t('cmd.config.allow_empty', undefined, loc)); return; }
+    if (r.reason === 'unusable_owner_entries' && 'entries' in r) {
+      await reply(t('cmd.config.allow_unusable_owner', { items: r.entries.join(', ') }, loc));
+      return;
+    }
     await reply(t('cmd.config.write_failed', { reason: r.reason }, loc));
     return;
   }
-  await reply(t('cmd.config.allow_ok', { count: r.resolved.length, total: r.raw.length }, loc));
+  let msg = t('cmd.config.allow_ok', { count: r.resolved.length, total: r.raw.length }, loc);
+  if (r.unresolvedUnionIds?.length) {
+    msg += '\n' + t('cmd.config.allow_warn_union', { items: r.unresolvedUnionIds.join(', ') }, loc);
+  }
+  await reply(msg);
 }
 
 function bytedcliLoginSuccessReply(botConfig: BotConfig, locale: Locale): string {
@@ -1472,7 +1481,7 @@ export async function handleCardCommand(
   const sub = content.replace(/^\/card\s*/i, '').trim().toLowerCase();
   const botConfig = getBot(larkAppId).config;
   const managedReplyMode = botConfig.replyCardMode && botConfig.replyCardMode !== 'legacy'
-    && ['claude-code', 'codex'].includes(ds?.session.cliId ?? botConfig.cliId);
+    && ['claude-code', 'codex', 'grok'].includes(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botConfig.cliId);
 
   if (sub === 'pin off') {
     const r = await setChatStreamingCardPin(larkAppId, chatId, false);
@@ -1773,6 +1782,33 @@ export async function handleCommand(
 
   try {
     switch (cmd) {
+      case '/queue': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        const text = message.content.replace(/^\/queue\b/i, '').trim();
+        if (!text || message.msgType !== 'text' || message.attachments?.length) {
+          await sessionReply(rootId, t('cmd.queue.usage', undefined, loc));
+          break;
+        }
+        const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+        if (cliId !== 'codex-app' || ds.adoptedFrom || ds.initConfig?.adoptMode) {
+          await sessionReply(rootId, t('cmd.queue.unsupported', undefined, loc));
+          break;
+        }
+        if (!ds.worker || ds.worker.killed || ds.pendingRepo || ds.initialStartPending
+          || ds.session.queuedActivationPending || isSessionTransferring(ds)) {
+          await sessionReply(rootId, t('cmd.queue.not_ready', undefined, loc));
+          break;
+        }
+        const accepted = await deps.submitQueuedMessage?.(ds, message, text, deps.invocationReplyTarget);
+        await sessionReply(rootId, t(accepted ? 'cmd.queue.accepted' : 'cmd.queue.failed', undefined, loc)
+          + (accepted && getBot(ds.larkAppId).config.triggerUserAuth?.enabled
+            ? '\n' + t('cmd.queue.identity_window', undefined, loc) : ''));
+        break;
+      }
+
       case '/effort': {
         if (!ds) {
           await replyNoSession(replyHere, loc);
@@ -5990,6 +6026,7 @@ export async function handleCommand(
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
           t('help.retry', undefined, loc),
+          t('help.queue', undefined, loc),
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),
           t('help.term', undefined, loc),

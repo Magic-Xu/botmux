@@ -258,6 +258,12 @@ export class TurnReplyCardStore {
       if (record.overflowMessageId && overflowText !== priorOverflowText) delete record.overflowMessageId;
       if (record.omitImages && record.finalCard) record.finalCard = omitReplyCardImages(record.finalCard);
       this.write(key, record);
+      // Retire an unshown merged turn under the publication lock. A delayed
+      // start must not resurrect it, while an unknown POST still needs its
+      // original UUID replayed and the resulting card patched to superseded.
+      if (record.phase === 'superseded' && !record.messageId && !record.pendingCreate && !record.finalCard) {
+        return { delivered: false, record };
+      }
       const visible = record.mode === 'unified' || io.forceVisible || !!record.finalCard || terminal || event.kind === 'terminal';
       if (!visible) return { delivered: false, record };
 

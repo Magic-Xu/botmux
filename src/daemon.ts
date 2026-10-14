@@ -151,6 +151,8 @@ import { migrateOverloadAlertAtStartup } from './services/overload-alert-migrati
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, evaluatePromptGate, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
+import { setTurnResultRuntime } from './core/turn-result-runtime.js';
+
 import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './services/usage-ledger.js';
 import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
 import { resolvePricingConfig } from './services/model-pricing.js';
@@ -188,6 +190,11 @@ import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkAttachment, LarkMessage } from './types.js';
+
+export function useOrdinaryOutputDelivery(): void {
+  setDurableBridgeFinalOutputHandler(undefined);
+  setDurableSessionSendHandler(null);
+}
 
 interface ScheduleRunLogErrorDetails {
   errorCode: string;
@@ -270,7 +277,7 @@ import { hasPendingSessionTurns, runSessionTurn } from './core/session-turn-queu
 import { setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import { authorizeTerminalStatusPage } from './core/terminal-write-auth.js';
-import type { CliId } from './adapters/cli/types.js';
+import { isCodexAppCliId, type CliId } from './adapters/cli/types.js';
 import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
 import { scanMultipleProjects } from './services/project-scanner.js';
@@ -5759,6 +5766,77 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
 
 export const __testOnly_prewarmDocCommentSession = prewarmDocCommentSession;
 
+/** /queue uses the same accepted ledger and native FIFO as ordinary input,
+ * without the positive authorization that permits steering an active turn. */
+async function submitQueuedMessage(
+  ds: DaemonSession, message: LarkMessage, text: string,
+  replyTarget?: import('./types.js').FrozenSessionReplyTarget,
+): Promise<boolean> {
+  const worker = ds.worker;
+  const generation = ds.session.workerGeneration;
+  const nativeThread = ds.session.cliSessionId;
+  const isCurrent = () => activeSessions.get(activeSessionKey(ds)) === ds
+    && ds.worker === worker && !!worker && !worker.killed
+    && ds.session.workerGeneration === generation
+    && ds.session.cliSessionId === nativeThread;
+  if (!isCurrent()) return false;
+  const senderIsBot = senderIsBotTriState(message.senderType,
+    isKnownPeerBot(config.session.dataDir, ds.larkAppId, message.senderId));
+  const sender = await resolveSender(ds.larkAppId, message.senderId, message.senderType);
+  if (!isCurrent()) return false;
+  const bot = getBot(ds.larkAppId);
+  const input = buildFollowUpCliInput(text, ds.session.sessionId, {
+    cliId: 'codex-app', sender, codexAppText: text,
+    mentions: message.mentions,
+    larkAppId: ds.larkAppId, chatId: ds.session.chatId,
+    selfMention: { name: bot.botName, openId: bot.botOpenId },
+    sessionBackendType: ds.session.backendType,
+    promptInjection: sessionPromptInjection(ds), turnId: message.messageId,
+  });
+  const previousQuote = { id: ds.session.quoteTargetId, sender: ds.session.quoteTargetSenderOpenId,
+    bot: ds.session.quoteTargetSenderIsBot };
+  const previousTarget = ds.currentReplyTarget;
+  const previousSessionTarget = ds.session.currentReplyTarget;
+  const rollbackReplyContext = () => {
+    delete ds.session.replyTargets?.[message.messageId];
+    delete ds.session.turnReplyContexts?.[message.messageId];
+    if (ds.currentReplyTarget?.turnId === message.messageId) ds.currentReplyTarget = previousTarget;
+    if (ds.session.currentReplyTarget?.turnId === message.messageId) ds.session.currentReplyTarget = previousSessionTarget;
+    if (ds.session.quoteTargetId === message.messageId) {
+      ds.session.quoteTargetId = previousQuote.id;
+      ds.session.quoteTargetSenderOpenId = previousQuote.sender;
+      ds.session.quoteTargetSenderIsBot = previousQuote.bot;
+    }
+    sessionStore.updateSession(ds.session);
+  };
+  ds.session.quoteTargetId = message.messageId;
+  ds.session.quoteTargetSenderOpenId = message.senderId;
+  ds.session.quoteTargetSenderIsBot = senderIsBot === true;
+  const root = replyTarget?.mode === 'thread' || replyTarget?.mode === 'quote'
+    ? replyTarget.rootMessageId : undefined;
+  beginReplyTargetTurn(ds, root, message.messageId, new Date().toISOString(), {
+    quoteOnly: replyTarget?.mode === 'quote',
+    senderOpenId: message.senderId,
+    participants: [{ openId: message.senderId, isBot: senderIsBot === true }],
+    inThread: !!message.threadId,
+  });
+  await noteTurnReceived(ds, message.messageId, text, sender, message.messageId);
+  // Identity refresh and reaction delivery both await external work.
+  if (!isCurrent()) { rollbackReplyContext(); return false; }
+  // Intentionally omit codexAppSteerable. The omission is frozen in the ledger
+  // and carried across runner recovery; user-written text cannot enable it.
+  if (!sendWorkerInput(ds, input, message.messageId, {
+    notifyRejection: false,
+    trustedCaller: trustedCallerForTurn(ds.larkAppId, message.senderId, message.senderUnionId, senderIsBot),
+  })) { rollbackReplyContext(); return false; }
+  ds.session.lastCallerOpenId = message.senderId;
+  beginNewTurn(ds, text, message.messageId);
+  rememberLastCliInput(ds, text, input);
+  markSessionActivity(ds, Date.now(), { human: senderIsBot === false });
+  sessionStore.updateSession(ds.session);
+  return true;
+}
+
 // Dependencies passed to command-handler
 const commandDeps: CommandHandlerDeps = {
   activeSessions,
@@ -5767,6 +5845,7 @@ const commandDeps: CommandHandlerDeps = {
   lastRepoScan,
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   prewarmDocCommentSession,
+  submitQueuedMessage,
 };
 
 /** Bind every reply produced by one slash-command invocation to the routing
@@ -7240,6 +7319,12 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     }
     const needsDelegation = targetAppIds.length > 0
       && (tools.length > 0 || scheduleCreateRequested);
+    // Host IPC authentication proves the local command, not a human turn.
+    // In particular a revoked worker may retain a policy-only origin. Never
+    // report a protected dispatch as sent after dropping its user authority.
+    if (needsDelegation && !turnId) {
+      return jsonRes(res, 403, { ok: false, error: 'dispatch_turn_unproven' });
+    }
     const directScheduleSource = !!active && active.turnId === turnId
       && active.caller.senderType === 'user' && !active.caller.source
       && !!active.caller.requestUserOpenId
@@ -7301,6 +7386,17 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     return jsonRes(res, 502, { ok: false, error: 'dispatch_delivery_failed', detail: error instanceof Error ? error.message : String(error) });
   }
 });
+
+/** Resolve schedule control from the exact live turn, not the busy/idle hint.
+ * The caller must still pass the route's managed-origin proof. Only an actual
+ * IM message can recover its caller from reply metadata: synthetic continuation
+ * turns may copy that metadata but do not represent a new human request. */
+function scheduleCallerForTurn(ds: DaemonSession, turnId: string): TrustedCaller | undefined {
+  const active = ds.activeInteractiveTurn;
+  if (active?.turnId === turnId) return active.caller;
+  if (!turnId.startsWith('om_')) return undefined;
+  return dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId));
+}
 
 // Managed schedule creation. The caller supplies task input only; creator
 // identity, grant scope and the commit authority are derived from this exact
@@ -7373,13 +7469,14 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   let credentialOpenId: string | undefined;
   let persistentRunScopes: Array<'bytedcli'> = [];
   let selfManage = false;
-  const active = ds.activeInteractiveTurn;
-  const direct = active?.turnId === turnId && active.caller.senderType === 'user'
-    && !active.caller.source && active.caller.requestLarkAppId === ds.larkAppId;
+  const caller = scheduleCallerForTurn(ds, turnId);
+  const direct = caller?.senderType === 'user'
+    && !caller.source && caller.requestLarkAppId === ds.larkAppId;
+  const capability = ds.managedTurnOrigin.capability;
   try {
     if (direct) {
-      controlOpenId = active.caller.requestUserOpenId;
-      controlUnionId = active.caller.requestUserUnionId
+      controlOpenId = caller.requestUserOpenId;
+      controlUnionId = caller.requestUserUnionId
         ?? (controlOpenId ? await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined : undefined);
       grantId = `direct:${sessionId}:${turnId}`;
     } else {
@@ -7440,7 +7537,8 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
         && !(await listChatMemberOpenIds(ds.larkAppId, task.chatId)).includes(controlOpenId))) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_operator_denied' });
     }
-    if (ds.managedTurnOrigin?.turnId !== turnId || ds.workerGeneration !== generation) {
+    if (ds.managedTurnOrigin?.turnId !== turnId || ds.workerGeneration !== generation
+      || ds.managedTurnOrigin.capability !== capability) {
       return jsonRes(res, 409, { ok: false, error: 'schedule_delegation_turn_changed' });
     }
     const baseParams = {
@@ -7526,13 +7624,12 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     claimedDispatchAttempt: body?.originDispatchAttempt,
   });
   const turnId = ds?.managedTurnOrigin?.turnId;
-  const active = ds?.activeInteractiveTurn;
+  const caller = ds && turnId ? scheduleCallerForTurn(ds, turnId) : undefined;
   const hostAdmin = trustedHost && !ds && body?.larkAppId === selfDaemonLarkAppId;
-  const currentHumanAdmin = !!ds && !!turnId && active?.turnId === turnId
-    && active.caller.senderType === 'user' && !active.caller.source
-    && active.caller.requestLarkAppId === ds.larkAppId
-    && !!active.caller.requestUserOpenId
-    && getDashboardAdminOpenIds(ds.larkAppId).includes(active.caller.requestUserOpenId);
+  const currentHumanAdmin = !!ds && caller?.senderType === 'user' && !caller.source
+    && caller.requestLarkAppId === ds.larkAppId
+    && !!caller.requestUserOpenId
+    && getDashboardAdminOpenIds(ds.larkAppId).includes(caller.requestUserOpenId);
   const action = body.action;
   const scheduledTaskId = turnId ? parseScheduledTurnId(turnId) : null;
   const requestedId = typeof body.id === 'string' && /^[0-9a-z_]{1,50}$/.test(body.id) ? body.id : '';
@@ -8099,7 +8196,9 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
     const codexDecision = validateCodexAppManagedSendOrigin(
       ds.session.codexAppDispatchLedger,
       ds.managedTurnOrigin,
-      ds.initConfig?.cliId === 'codex-app' || ds.session.cliId === 'codex-app',
+      // 刻意取 initConfig（最近一次下发给 worker 的）与 session.cliId 两者之一，fail-closed：
+      // 任一方认定 Codex App 就要求 ledger 精确匹配；与 worker.ts 的 codexAppManagedOrigin 同形。
+      isCodexAppCliId(ds.initConfig?.cliId) || isCodexAppCliId(ds.session.cliId),
     );
     if (!codexDecision.ok) {
       return jsonRes(res, 409, { ok: false, error: 'origin_not_sendable' });
@@ -8459,7 +8558,8 @@ ipcRoute('POST', '/api/hooks/emit', async (req, res) => {
     const codexDecision = validateCodexAppManagedSendOrigin(
       ds!.session.codexAppDispatchLedger,
       ds!.managedTurnOrigin!,
-      ds!.initConfig?.cliId === 'codex-app' || ds!.session.cliId === 'codex-app',
+      // 同 /api/send：initConfig 与 session.cliId 任一为 Codex App 即要求 ledger 精确匹配。
+      isCodexAppCliId(ds!.initConfig?.cliId) || isCodexAppCliId(ds!.session.cliId),
     );
     if (!codexDecision.ok) {
       return jsonRes(res, 409, { ok: false, error: 'origin_not_sendable' });
@@ -21827,7 +21927,11 @@ function forkReservedInitialRawSession(ds: DaemonSession, availableBots: Availab
         ? [ds.pendingCodexAppText ?? '', ...(ds.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
         : ds.pendingPrompt || ds.pendingFollowUps?.join('\n\n') || '',
       cliInput: input.content,
-      ...((ds.session.cliId === 'codex-app' || botCfg.cliId === 'codex-app')
+      // 会话生效 CLI 用与 sessionCliId 同样的 snapshot → session.cliId → bot 优先级。曾经是
+      // session.cliId 与 bot.cliId「任一为 codex-app」的 OR：`/cli codex-app` 之后、首次 fork 之前
+      // （snapshot pending、session.cliId 为空）而 bot 默认不是 codex-app 时，OR 恒为 false，
+      // 把 bufferedCodexAppInputAccepted 已放行的 sidecar 又丢掉。
+      ...(isCodexAppCliId(ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId)
         && bufferedCodexAppInputAccepted
         && input.codexAppInput
         ? { codexAppInput: input.codexAppInput }
@@ -22310,7 +22414,7 @@ async function startInitialPassthroughSession(args: {
   const substituteReplyMode = substitute
     ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
     : 'thread';
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute, senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete, inThread: !!parsed.threadId });
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute, senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete, inThread: !!parsed.threadId, sourceMessageId: parsed.messageId });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -23466,7 +23570,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Turn key is the reply anchor (== messageId outside session-group births) so
   // the per-turn reply context and currentReplyTarget.turnId line up with the
   // worker's turn id — current-turn provenance requires that equality.
-  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
+  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -24293,7 +24397,8 @@ async function handleBotAdded(
       initialStartPending: true,
       pendingRepo: !pinnedWorkingDir || autoWt,
       pendingPrompt: promptBody,
-      pendingCodexAppText: botCfg.cliId === 'codex-app' ? codexAppText : undefined,
+      // 新建话题：session 刚创建、尚无 cliId / cliLaunchSnapshot（`/cli use` 只能在之后触发），bot 配置是唯一来源。
+      pendingCodexAppText: isCodexAppCliId(botCfg.cliId) ? codexAppText : undefined,
       pendingChatContext: chatContext,
       ownerOpenId: operatorOpenId,
       currentTurnTitle: title,
@@ -25565,7 +25670,7 @@ async function handleThreadReplyAdmitted(
     // on the double-race (matches the new-topic path's collectPostAtMentions args).
     const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt);
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
@@ -26026,7 +26131,7 @@ async function handleThreadReplyAdmitted(
       : 'thread';
     const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, autoCreatePostAt);
-    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
+    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId });
     sessionStore.updateSession(newDs.session);
     const registration = await claimNewDaemonSession(activeSessions, newDs);
     if (!registration.accepted) {
@@ -26527,7 +26632,11 @@ async function handleThreadReplyAdmitted(
     if (ds.session.queuedActivationPending) {
       await stageCurrentBehindQueuedActivation();
       try {
-        const recoverThroughCodexLedger = (ds.session.cliId ?? dsBotCfgForFork.cliId) === 'codex-app';
+        // 与 worker-pool 的 resolveQuarantinedForkPlan / acceptCodexAppDispatch 同源（含 snapshot）：
+        // restore 出来的 tail-only 会话 promote 后可能从未 fork 过，snapshot 仍 pending。
+        const recoverThroughCodexLedger = isCodexAppCliId(
+          ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
+        );
         forkWorker(
           ds,
           recoverThroughCodexLedger ? '' : (ds.session.queuedActivationInput ?? ''),
@@ -30232,8 +30341,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }));
     setDurableSessionSendHandler(deliverDurablePrimaryMessage);
   } else {
-    setDurableBridgeFinalOutputHandler(undefined);
-    setDurableSessionSendHandler(null);
+    useOrdinaryOutputDelivery();
   }
   xpiSessionStoreBusyNoticeReadyApps.add(cfg.larkAppId);
   // The restore preflight only records structured diagnostics. Human-readable
@@ -31084,6 +31192,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Dispatcher stop always receives the hard-clamped remaining budget (never
     // its internal 5s default), success or failure path alike.
     await feedbackWebhookDispatcher?.stop(remainingBudget());
+    setTurnResultRuntime(undefined);
     for (const runtime of durablePrimaryRuntimes) {
       const stopped = await runtime.stop(remainingBudget());
       if (stopped.kind === 'timed_out') {

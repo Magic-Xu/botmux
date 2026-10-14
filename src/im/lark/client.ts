@@ -36,56 +36,11 @@ import {
 import type { ChatContext } from '../../types.js';
 import { downloadResourceWithRange, isResourceSizeLimitError, type ResourceStream } from './resource-range-download.js';
 
-type LarkRequestParams = Record<string, string | number | boolean | undefined>;
-
-export interface LarkRequestOptions {
-  /** Axios 层的真实请求超时；不设置时保持 SDK 原有行为。 */
-  timeoutMs?: number;
-  /** 透传给 Axios，用于在上层截止时间到达时主动取消网络请求。 */
-  signal?: AbortSignal;
-}
-
-function larkRequestDeadline(options?: LarkRequestOptions): {
-  timeout?: number;
-  signal?: AbortSignal;
-} {
-  const timeout = options?.timeoutMs;
-  return {
-    ...(typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0
-      ? { timeout: Math.max(1, Math.floor(timeout)) }
-      : {}),
-    ...(options?.signal ? { signal: options.signal } : {}),
-  };
-}
-
-/**
- * Call a Feishu GET endpoint without a request body.
- *
- * The official SDK currently lets axios attach `{}` as `data` for generated
- * GET calls such as im.v1.message.list/get, im.v1.chat.get/list,
- * im.v1.chatMembers.isInChat and contact.v3.user.get. Some gateway
- * deployments reject GET-with-body and return HTTP 411 before the OpenAPI
- * handler sees the request. The SDK's generic `client.request()` contains an
- * explicit GET empty-body guard (`fix: #153`) while still using the SDK's
- * token/cache/auth plumbing, so route every read-only GET through it.
- *
- * `url` is the API path (e.g. `/open-apis/im/v1/chats/<id>`); path params must
- * already be interpolated by the caller. Returns the parsed JSON body
- * (`{ code, msg, data }`), identical to the generated method's resolved value.
- */
-export async function larkGet(
-  c: any,
-  url: string,
-  params: LarkRequestParams = {},
-  options?: LarkRequestOptions,
-): Promise<any> {
-  return c.request({
-    method: 'GET',
-    url,
-    params,
-    ...larkRequestDeadline(options),
-  });
-}
+// larkGet lives in a dependency-free module so setup/owner-identity.ts (shared
+// by every onboarding / allowedUsers write path) can use the same no-body GET
+// without importing this whole client graph. Re-exported for existing callers.
+import { larkGet, larkRequestDeadline, type LarkRequestOptions } from './lark-get.js';
+export { larkGet, type LarkRequestOptions };
 
 // Cached lightweight Lark clients for all configured bots (for isInChat checks).
 //
@@ -2296,6 +2251,11 @@ interface MessagePageScan {
   /** `Failed to <errorAction>: …` text of the thrown {@link LarkApiError}. Differs
    *  per public entry point and is kept verbatim for log/regex compatibility. */
   errorAction: string;
+  /** Per-request HTTP timeout, forwarded to every page request; unset keeps the SDK default. */
+  timeoutMs?: number;
+  /** Cancellation signal: forwarded to every page request and checked before the
+   *  next page is fetched, so an aborted scan stops paging immediately. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -2313,6 +2273,7 @@ interface MessagePageScan {
 async function* iterateMessagePages(c: any, scan: MessagePageScan): AsyncGenerator<any[], void, void> {
   let pageToken: string | undefined;
   do {
+    scan.signal?.throwIfAborted();
     const res = await larkGet(c, '/open-apis/im/v1/messages', {
       container_id_type: scan.containerType,
       container_id: scan.containerId,
@@ -2320,7 +2281,8 @@ async function* iterateMessagePages(c: any, scan: MessagePageScan): AsyncGenerat
       sort_type: 'ByCreateTimeDesc',
       with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
-    });
+    }, { timeoutMs: scan.timeoutMs, signal: scan.signal });
+    scan.signal?.throwIfAborted();
 
     if (res.code !== 0) {
       throw larkApiError(scan.errorAction, res);
@@ -2386,6 +2348,10 @@ export async function listChatMessages(
 export interface ChatMessageScanOptions {
   /** Lark page size per request. Clamped to the API max of 50. */
   pageSize?: number;
+  /** 每页请求的 HTTP 超时（透传给 Axios）；不设置时保持 SDK 默认行为。 */
+  timeoutMs?: number;
+  /** 取消信号：透传给每页请求，且在翻页前检查——被取消后不再发起下一页。 */
+  signal?: AbortSignal;
   /**
    * Called while scanning newest -> oldest. Returning true stops after the
    * current message has been included in the returned chronological list.
@@ -2407,6 +2373,8 @@ export async function listChatMessagesUntil(
 
   for await (const items of iterateMessagePages(c, {
     containerType: 'chat', containerId: chatId, pageSize, errorAction: 'list chat messages',
+    timeoutMs: options.timeoutMs,
+    signal: options.signal,
   })) {
     for (const item of items) {
       allMessages.push(item);

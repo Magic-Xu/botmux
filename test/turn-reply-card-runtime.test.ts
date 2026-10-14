@@ -121,6 +121,25 @@ describe('reply-card runtime eligibility and recovery', () => {
     else expect(updateMessage).not.toHaveBeenCalled();
   });
 
+  it.each(['unified', 'final-only'] as const)('silently retires an unshown %s turn before delayed activity starts', async mode => {
+    const ds = session();
+    ds.session.cliId = 'grok';
+    ds.replyCardRunningTurnId = 'om_mode';
+    const store = new TurnReplyCardStore(dir);
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+    store.prepareSync(key, { mode, chatId: ds.chatId, rootId: ds.session.rootMessageId });
+    const send = vi.fn(async () => 'om_reply');
+    queueTurnReplyTools(ds, { turnId: 'om_mode', entries: [] }, send, () => true);
+    await supersedeTurnReplyCard(ds, { turnId: 'om_mode' }, send, () => true);
+    await flushTurnReplyTools(ds, 'om_mode');
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'refresh' }, send);
+    expect(store.read(key)?.phase).toBe('superseded');
+    expect(ds.replyCardRunningTurnId).toBeUndefined();
+    expect(send).not.toHaveBeenCalled();
+    expect(updateMessage).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])('private replies bypass dynamic cards with an existing reservation=%s', async reserved => {
     const ds = session();
     Object.assign(ds.session, { larkAppId: ds.larkAppId, chatType: 'group', scope: 'thread' });
