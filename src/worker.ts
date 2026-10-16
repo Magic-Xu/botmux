@@ -1649,6 +1649,12 @@ let seatbeltProfilePath: string | null = null;       // per-session Seatbelt .sb
 let sandboxStopWatcher: (() => void) | null = null;  // stop fn for the sandbox outbox watcher
 let sandboxCleanup: (() => void) | null = null;      // reclaim deny-mask mountpoints + rm the per-session sandbox tree
 let sandboxRelayOutbox: string | null = null;
+/** The credential-only relay belongs to a persistent pane that keeps running
+ *  when this worker exits (tmux/zellij/herdr/zmx `kill()` only detaches). A
+ *  parent-exit shutdown (daemon restart, IPC disconnect, watchdog) must then
+ *  leave its outbox for the successor worker to re-serve; only a real close /
+ *  restart / a PTY-owned CLI tears it down. */
+let credentialOnlyRelayOutlivesWorker = false;
 let sandboxRelayCapability: { token: string; turnId?: string; dispatchAttempt?: number } | null = null;
 let sandboxPolicyCapability: string | null = null;
 let readIsolationOriginCapabilityFile: string | null = null;
@@ -3452,6 +3458,10 @@ function markTurnRetired(turnId?: string): void {
   }
 }
 let durableTurnInFlight = false;
+/** A remote provider declared one already-submitted turn during resume. This is
+ * distinct from currentBotmuxTurnId: a fresh initial prompt reserves that id
+ * before submitTurn awaits the provider ready handshake. */
+let remoteRunnerRecoveredTurnInFlight = false;
 const activeTurnAuthority = new ActiveTurnAuthority((previousTurnId, turnId) => {
   // Ordered IPC reaches the daemon before any output attributed to the steer.
   send({ type: 'active_turn_envelope_changed', previousTurnId, turnId });
@@ -14443,6 +14453,7 @@ async function flushPending(): Promise<void> {
               content: msg,
               turnId: item.turnId,
               ...(item.replyTurnId ? { replyTurnId: item.replyTurnId } : {}),
+              ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
               ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
             });
           }
@@ -15714,6 +15725,7 @@ async function spawnCli(
   opts: { pluginGenerationPrepared?: boolean } = {},
 ): Promise<void> {
   if (!codexRpcEngine) codexCleanupLaunchTarget = undefined;
+  remoteRunnerRecoveredTurnInFlight = false;
   if (cfg.adoptMode && cfg.serviceTier) {
     throw new Error('adopted CLI sessions cannot apply an explicit serviceTier');
   }
@@ -19502,6 +19514,7 @@ async function spawnCli(
     if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
     sandboxCleanup = credentialRelay.cleanup;
     sandboxRelayOutbox = credentialRelay.outbox;
+    credentialOnlyRelayOutlivesWorker = !!persistentSessionName && effectiveBackendType !== 'pty';
     // session-id is FORCED so a relayed send cannot target another session.
     sandboxStopWatcher = startOutboxWatcher(
       credentialRelay.outbox,
@@ -19541,6 +19554,7 @@ async function spawnCli(
     if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
     sandboxCleanup = credentialRelay.cleanup;
     sandboxRelayOutbox = credentialRelay.outbox;
+    credentialOnlyRelayOutlivesWorker = effectiveBackendType !== 'pty';
     sandboxStopWatcher = startOutboxWatcher(
       credentialRelay.outbox,
       childEnv,
@@ -20435,6 +20449,47 @@ async function spawnCli(
     }
     return deliverRemoteRunnerSessionTool(operation);
   });
+  backend.onTurnRecovered?.((turn) => {
+    if (fatalWorkerErrorPending || backend !== observedBackend) return;
+    try {
+      if (currentBotmuxTurnId && currentBotmuxTurnId !== turn.turnId) {
+        throw new Error(
+          `turn ${currentBotmuxTurnId.substring(0, 12)} already owns this worker`,
+        );
+      }
+      setCaptureIdentity(turn.turnId, turn.dispatchAttempt);
+      // Only receiver attempts participate in the durable HOL protocol. An
+      // ordinary primary Lark turn has no dispatchAttempt; its recovered-turn
+      // fence below still blocks startup readiness until the provider settles,
+      // but must not arm a latch that only an attempt-bearing terminal can
+      // release.
+      if (turn.dispatchAttempt !== undefined) durableTurnInFlight = true;
+      remoteRunnerRecoveredTurnInFlight = true;
+      currentTurnSteerPromoted = false;
+      markActiveTurnStarted({
+        turnId: turn.turnId,
+        dispatchAttempt: turn.dispatchAttempt,
+        trustedCaller: turn.trustedCaller,
+      });
+      publishSandboxRelayCapability();
+      log(
+        `Recovered provider-owned remote turn ${turn.turnId.substring(0, 12)} `
+        + `generation=${turn.generation} attempt=${turn.dispatchAttempt ?? '-'}`,
+      );
+    } catch (error) {
+      log(
+        `Refused recovered remote turn ${turn.turnId.substring(0, 12)}: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+      emitTurnTerminal(
+        turn.turnId,
+        'ambiguous',
+        'remote_turn_recovery_authority_mismatch',
+        turn.dispatchAttempt,
+      );
+      observedBackend.kill();
+    }
+  });
   backend.onTurnFailure?.((failure) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) return;
     if (currentBotmuxTurnId && failure.turnId !== currentBotmuxTurnId) {
@@ -20469,6 +20524,10 @@ async function spawnCli(
   backend.onReady?.(() => {
     if (backend !== observedBackend || fatalWorkerErrorPending) return;
     if (effectiveBackendType === 'remote-runner') {
+      if (remoteRunnerRecoveredTurnInFlight && currentBotmuxTurnId) {
+        log(`Remote runner ready with recovered turn ${currentBotmuxTurnId.substring(0, 12)} still active`);
+        return;
+      }
       markRemoteRunnerStartupReady();
       return;
     }
@@ -20989,6 +21048,7 @@ function killCli(opts: {
     try { sandboxCleanup(); } catch { /* */ }
     sandboxCleanup = null;
   }
+  credentialOnlyRelayOutlivesWorker = false;
   isPromptReady = false;
   forceClearSessionRenameInFlight();
   if (!opts.preservePending) {
@@ -21725,7 +21785,7 @@ function getTerminalHtml(
 <meta name="format-detection" content="telephone=no">
 <title>${cliName()} - ${label}</title>
 <link rel="icon" type="image/png" href="${TERMINAL_FAVICON_DATA_URI}">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;background:#1a1b26;overflow:hidden;overscroll-behavior:none}
@@ -21943,12 +22003,12 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
   </div>
 </form>
 <div id="status" class="err">connecting...</div>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0/lib/addon-web-links.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0/lib/addon-unicode11.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0/lib/addon-webgl.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-canvas@0/lib/addon-canvas.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.8.0/lib/addon-unicode11.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.18.0/lib/addon-webgl.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-canvas@0.7.0/lib/addon-canvas.min.js"></script>
 <script>
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
 if(isTouch){document.body.classList.add('touch');}
@@ -23370,6 +23430,7 @@ function emitTurnTerminal(
     ...(timing ? { completedAtMs: timing.completedAtMs } : {}),
     ...(timing?.durationMs !== undefined ? { durationMs: timing.durationMs } : {}),
   });
+  let wakePending = false;
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
     { turnId, dispatchAttempt },
@@ -23379,6 +23440,19 @@ function emitTurnTerminal(
     // fresh process behind the receiver's newer dispatch attempt.
     inflightInputs.onTurnComplete();
     durableTurnInFlight = false;
+    wakePending = true;
+  }
+  if (remoteRunnerRecoveredTurnInFlight
+    && currentBotmuxTurnId === turnId
+    && currentBotmuxDispatchAttempt === dispatchAttempt) {
+    // Recovered ordinary turns intentionally have no dispatch attempt, so the
+    // durable-attempt predicate above cannot release this independent startup
+    // fence. Exact turn identity is sufficient: a later/stale terminal cannot
+    // match after capture attribution advances.
+    remoteRunnerRecoveredTurnInFlight = false;
+    wakePending = true;
+  }
+  if (wakePending) {
     // The terminal may be emitted from inside an active flush continuation
     // (for example a synchronous hard-submit failure). Wake after that
     // continuation releases the mutex so queued work cannot remain stranded.
@@ -25324,11 +25398,27 @@ function shutdownWorkerForParentExit(reason: string): void {
   stopScreenshotLoop();
   if (lastInitConfig?.existingAppServerEndpoint) {
     log(`Preserving existing-App-Server remote TUI during ${reason}`);
+    // The remote TUI keeps running in its credential-only pane too, still bound
+    // to its relay outbox by inode. This branch never runs killCli, so drop
+    // only the tree-removal reference: the exit hook still stops the watcher
+    // and revokes this generation's capability leaf (the successor republishes
+    // it), but must not delete the outbox the live TUI sends through.
+    if (credentialOnlyRelayOutlivesWorker) {
+      log(`Preserving credential-only relay outbox for the surviving remote TUI during ${reason}`);
+      sandboxCleanup = null;
+    }
     cleanup();
     process.exit(0);
     return;
   }
-  killCli();
+  // A persistent credential-only pane survives this exit (backend.kill() only
+  // detaches) and still holds a bind of its relay outbox by inode. Deleting the
+  // tree here would make the next worker's reattach gate kill + cold-spawn it,
+  // interrupting in-flight work on every daemon restart. Keep it, exactly like
+  // detach_for_transfer / suspend; a real close still removes it.
+  const preserveSandbox = credentialOnlyRelayOutlivesWorker;
+  if (preserveSandbox) log(`Preserving credential-only relay outbox for the surviving pane during ${reason}`);
+  killCli({ preserveSandbox });
   cleanup();
   process.exit(0);
 }
