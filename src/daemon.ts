@@ -123,11 +123,15 @@ import {
   type DurableLarkOutboxTarget,
 } from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
-import { parseDurablePrimarySessionRecord } from './services/durable-session-primary.js';
+import {
+  claimDurableLarkActiveSession,
+  parseDurablePrimarySessionRecord,
+} from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
 import { closeResidualIsLocal, describeCloseResidual } from './core/close-residual.js';
 import { durableLarkSessionControlPartitionPrefix } from './services/durable-lark-session-control.js';
-import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
+import { failedTurnCaller, recordLimitedFailedTurn, clearLimitedFailedTurn, recordFailedTurnTerminal, noteFailedTurnRecoveryInput } from './core/failed-turn-recovery.js';
+import { isSilentScheduledTurn } from './core/silent-schedule-turns.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
@@ -427,6 +431,7 @@ import {
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
   resumeSession,
+  takeOverDurableActiveRemoteSession,
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
 import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
@@ -434,7 +439,7 @@ import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser,
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
 import { computeInputHash } from './utils/canonical-input-hash.js';
-import { authorizeDelegatedScheduleRun, authorizeDelegatedScheduleSelfManage } from './core/schedule-delegated-runtime.js';
+import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
 import { parseScheduledTurnId, trustedCallerForScheduledTask } from './core/scheduled-turn-provenance.js';
 import { TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
@@ -3946,7 +3951,9 @@ async function dispatchUserForTurn(ds: DaemonSession, turnId: string) {
   const reply = pickTurnReplyTarget(ds.session, turnId);
   if (!reply) return undefined;
   const active = ds.activeInteractiveTurn;
-  const caller = active?.turnId === turnId ? active.caller : dispatchCallerFromReply(ds.larkAppId, reply);
+  const recoveryCaller = ds.session.failedTurnRecovery?.turnId === turnId
+    ? ds.session.failedTurnRecovery.caller : undefined;
+  const caller = recoveryCaller ?? (active?.turnId === turnId ? active.caller : dispatchCallerFromReply(ds.larkAppId, reply));
   // A positively identified human already has a platform identity. Their turn
   // does not depend on the unrelated delegation store being readable.
   if (caller?.senderType === 'user' && !caller.source
@@ -7381,8 +7388,9 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     }
     const authority = needsDelegation && turnId ? await authorityForDispatch({
       sourceAppId: ds.larkAppId,
-      caller: active?.turnId === turnId ? active.caller
-        : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
+      caller: ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
+        : active?.turnId === turnId ? active.caller
+          : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
       inherited: inherited?.authority,
       tools,
       ...(scheduleCreateRequested ? {
@@ -7452,6 +7460,17 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   try { body = await readJsonBody(req, 64 * 1024); }
   catch { return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_request' }); }
   const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : '';
+  const remoteRunnerSessionTool = body?.remoteRunnerSessionTool === true;
+  if (body?.remoteRunnerSessionTool !== undefined && !remoteRunnerSessionTool) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_request' });
+  }
+  const remoteRunnerControllerOpenId = body?.remoteRunnerControllerOpenId;
+  if (remoteRunnerControllerOpenId !== undefined
+      && (!remoteRunnerSessionTool
+        || typeof remoteRunnerControllerOpenId !== 'string'
+        || !/^ou_[A-Za-z0-9_-]{1,160}$/.test(remoteRunnerControllerOpenId))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_request' });
+  }
   const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
   const trustedHost = isTrustedHostIpcRequest(req);
   const verified = authorizeSessionScopedIpc({
@@ -7505,6 +7524,22 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   const reply = pickTurnReplyTarget(ds.session, ds.managedTurnOrigin.turnId);
   const expectedRoot = reply?.rootMessageId
     ?? ((ds.scope ?? ds.session.scope) === 'thread' ? ds.session.rootMessageId : undefined);
+  if (remoteRunnerSessionTool) {
+    const expectedWorkingDir = ds.workingDir ?? ds.session.workingDir;
+    if (!expectedWorkingDir
+      || task.chatId !== ds.chatId
+      || task.workingDir !== expectedWorkingDir
+      || task.deliver === 'local') {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_scope_invalid' });
+    }
+    if (task.executionPosition === 'topic'
+      && (!expectedRoot || task.rootMessageId !== expectedRoot)) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_root_mismatch' });
+    }
+    if (task.executionPosition !== 'topic' && task.rootMessageId !== undefined) {
+      return jsonRes(res, 400, { ok: false, error: 'schedule_session_tool_root_forbidden' });
+    }
+  }
   const turnId = ds.managedTurnOrigin.turnId;
   const generation = ds.workerGeneration;
   let controlOpenId: string | undefined;
@@ -7516,15 +7551,26 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   let persistentRunScopes: Array<'bytedcli'> = [];
   let selfManage = false;
   const caller = scheduleCallerForTurn(ds, turnId);
-  const direct = caller?.senderType === 'user'
+  const directHuman = caller?.senderType === 'user'
     && !caller.source && caller.requestLarkAppId === ds.larkAppId;
+  const providerActor = caller?.senderType === 'bot'
+    && caller.requestLarkAppId === ds.larkAppId
+    && typeof remoteRunnerControllerOpenId === 'string';
+  if (remoteRunnerControllerOpenId && !providerActor) {
+    return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_controller_forbidden' });
+  }
+  const direct = directHuman || providerActor;
   const capability = ds.managedTurnOrigin.capability;
   try {
-    if (direct) {
-      controlOpenId = caller.requestUserOpenId;
-      controlUnionId = caller.requestUserUnionId
+    if (directHuman) {
+      controlOpenId = caller!.requestUserOpenId;
+      controlUnionId = caller!.requestUserUnionId
         ?? (controlOpenId ? await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined : undefined);
       grantId = `direct:${sessionId}:${turnId}`;
+    } else if (providerActor) {
+      controlOpenId = remoteRunnerControllerOpenId;
+      controlUnionId = await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined;
+      grantId = `provider-actor:${sessionId}:${turnId}`;
     } else {
       if (readGlobalConfig().scheduleDelegation?.createEnabled !== true) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_disabled' });
@@ -7698,16 +7744,20 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   }
   const authority = scheduleAuthorityStore?.getRecord(appId, id);
   if (!authority) return jsonRes(res, 404, { ok: false, error: 'schedule_not_found' });
+  if (potentialScheduledSelfManager && action === 'remove' && authority.state === 'revoked') {
+    return jsonRes(res, 200, { ok: true, replay: true });
+  }
   const scheduledSelfManager = potentialScheduledSelfManager
-    && authority.kind === 'delegated'
-    && authority.selfManage;
+    && (authority.kind === 'direct'
+      || (authority.kind === 'delegated' && authority.selfManage));
   if (potentialScheduledSelfManager && !scheduledSelfManager) {
-    return jsonRes(res, 403, { ok: false, error: 'delegated_schedule_self_manage_denied' });
+    return jsonRes(res, 403, { ok: false, error: 'schedule_self_manage_denied' });
   }
   if (scheduledSelfManager) {
     try {
-      await authorizeDelegatedScheduleSelfManage(authority, {
+      await authorizeScheduleSelfManage(authority, {
         selfManageEnabled: readGlobalConfig().scheduleDelegation?.selfManageEnabled === true,
+        targetChatId: ds!.chatId,
         adminOpenIds: getDashboardAdminOpenIds(appId),
         resolveTargetOpenId: async unionId => {
           const resolved = await resolveTargetAppOpenId(appId, unionId);
@@ -7718,7 +7768,7 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     } catch (error) {
       return jsonRes(res, 403, {
         ok: false,
-        error: 'delegated_schedule_self_manage_denied',
+        error: 'schedule_self_manage_denied',
         detail: error instanceof Error ? error.message : String(error),
       });
     }
@@ -22816,6 +22866,10 @@ async function prepareGroupBackground(data: any, ctx: RoutingContext): Promise<v
 }
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
+  if (!ctx.completionProposalContinuation && !ctx.cascadeBodyReentry) {
+    noteFailedTurnRecoveryInput(ctx.larkAppId, ctx.runtimeRoutingAnchor ?? ctx.anchor, ctx.messageId);
+  }
+
   ctx.ingressAdmission ??= { admitted: false };
   if (getBot(ctx.larkAppId).config.codexInstancePool) {
     const deliveryKey = `\u0000thread-delivery:${ctx.larkAppId}:${ctx.scope}:${ctx.anchor}`;
@@ -25151,6 +25205,10 @@ async function handleThreadReply(
   /** 级联推迟重入：首过 preamble 的 parsed + resources。不是 PreparedThreadReply，配额与下载仍重跑。 */
   replay?: { parsed: LarkMessage; resources: MessageResource[] },
 ): Promise<void> {
+
+  if (!ctx.completionProposalContinuation && !ctx.cascadeBodyReentry) {
+    noteFailedTurnRecoveryInput(ctx.larkAppId, ctx.runtimeRoutingAnchor ?? ctx.anchor, ctx.messageId);
+  }
   // Admission is bot-wide but intentionally concurrent. Add a narrower FIFO
   // before entering it so two same-anchor deliveries can never invert while
   // quota/resource/sender preparation awaits. Synthetic keys share the same
@@ -27633,6 +27691,25 @@ function currentDocSubscriptionForDelivery(
   return current;
 }
 
+/** Refresh the dashboard activity clock after document-comment admission.
+ *
+ * At this point the worker already owns the turn. Activity persistence is a
+ * presentation side effect: if it fails, the provider must still observe a
+ * successful delivery or it will retry an already-executing comment after the
+ * cleanup path has removed its reply target. */
+function markDocCommentActivityAfterAdmission(ds: DaemonSession, turnId: string): void {
+  try {
+    // Comment events do not prove a Lark sender_type, so do not advance the
+    // stricter human-only clock used by schedule --follow-active.
+    markSessionActivity(ds);
+  } catch (err) {
+    logger.error(
+      `[${tag(ds)}] doc-comment activity projection failed after admission `
+      + `(turn ${turnId.slice(0, 8)}): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 async function runClaimedDocCommentTurn(
   claimKey: string,
   work: () => Promise<void>,
@@ -27901,6 +27978,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
           throw new Error('worker became unavailable during comment:live-send');
         }
         acceptDocCommentSession(ds);
+        markDocCommentActivityAfterAdmission(ds, turnId);
         try {
           beginNewTurn(ds, text, turnId);
         } catch (err) {
@@ -27976,6 +28054,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
         }
         acceptDocCommentSession(ds);
       }
+      markDocCommentActivityAfterAdmission(ds, turnId);
     }, cleanupFailedDelivery);
   } catch (err) {
     if (err instanceof DocCommentSubscriptionChangedError) {
@@ -29047,6 +29126,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onScreenStatus(ds, context) {
+      try {
+        if (context.status === 'limited') recordLimitedFailedTurn(ds, context.turnId);
+        else if (context.prevStatus === 'limited') clearLimitedFailedTurn(ds);
+      } catch (error) { logger.error(`[recovery] quota snapshot failed: ${String(error)}`); }
       return cardRuntimeStatusBridge.publish({
         sessionId: ds.session.sessionId,
         larkAppId: ds.larkAppId,
@@ -29120,6 +29203,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       } catch { logger.warn('[group-context] native input receipt unavailable; background may repeat'); }
     },
     async onTurnTerminal(ds, terminal, context) {
+      const originalFailedCaller = failedTurnCaller(ds, terminal.turnId);
+      const originalFailedSilent = isSilentScheduledTurn(ds, terminal.turnId);
       // Queue ACKs do not prove consumption. Only a matching completed native
       // turn confirms that this exact frozen input reached this conversation.
       if (terminal.status === 'completed' && ds.session.workerGeneration === context.workerGeneration) {
@@ -29194,25 +29279,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // turn-completion enqueue above). The reply-target guard skips type-ahead
       // scenarios where a newer turn already owns the captured prompt.
       try {
-        // shouldRecordFailedTurn guarantees failed/ambiguous; re-narrow to the
-        // typed builder (property narrowing does not propagate to the argument).
-        const failedStatus = terminal.status === 'failed' || terminal.status === 'ambiguous'
-          ? terminal.status
-          : undefined;
-        if (failedStatus && shouldRecordFailedTurn(terminal, ds.currentReplyTarget?.turnId)) {
-          const record = buildFailedTurnRecord(
-            { turnId: terminal.turnId, status: failedStatus, errorCode: terminal.errorCode },
-            {
-              userPrompt: ds.lastUserPrompt,
-              cliInput: ds.lastCliInput,
-              codexAppInput: ds.lastCodexAppInput,
-            },
-          );
-          if (record) {
-            ds.session.lastFailedTurn = record;
-            sessionStore.updateSession(ds.session);
-          }
-        }
+        recordFailedTurnTerminal(ds, terminal, { workerGeneration: context.workerGeneration,
+          caller: originalFailedCaller, silent: originalFailedSilent });
       } catch (err) {
         logger.error(`[retry] failed to record lastFailedTurn for ${terminal.turnId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -30112,6 +30180,43 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               const current = await durableCoordinationRuntime.store.readSession(stableKey);
               return current ? parseDurablePrimarySessionRecord(current).session : undefined;
             },
+            takeOverPrimarySession: async (stableKey, canonical) => {
+              if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
+              try {
+                const claimed = await claimDurableLarkActiveSession({
+                  facade: primaryRuntime.session,
+                  sessionKey: stableKey,
+                  expectedSessionId: canonical.sessionId,
+                  expectedLarkAppId: cfg.larkAppId,
+                });
+                if (claimed.kind !== 'claimed') {
+                  throw new Error(
+                    claimed.kind === 'occupied'
+                      ? `durable active takeover Session is occupied by ${claimed.ownerId}`
+                      : `durable active takeover claim failed: ${claimed.kind}`,
+                  );
+                }
+                const local = activeSessions.get(stableKey);
+                if (local?.session.sessionId === claimed.session.sessionId
+                    && local.session.status === 'active') {
+                  return local.session;
+                }
+                const takeover = await takeOverDurableActiveRemoteSession(
+                  claimed.session,
+                  activeSessions,
+                );
+                if (!takeover.ok) {
+                  throw new Error(
+                    `durable active takeover failed: ${takeover.error}`
+                    + (takeover.detail ? ` (${takeover.detail})` : ''),
+                  );
+                }
+                return takeover.ds.session;
+              } catch (error) {
+                await primaryRuntime.session.releaseLease(stableKey);
+                throw error;
+              }
+            },
           },
         );
         startEventDispatchers.push(() => {
@@ -30220,8 +30325,30 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               partitionKeyPrefix: durableLarkSessionControlPartitionPrefix(cfg.larkAppId),
               resolve: primaryControlRuntime.resolve,
             },
-            onLeadershipAcquired: () => { eventRuntime.connect(); },
+            onLeadershipAcquired: leadership => {
+              const recovery = eventRuntime.connectPrimary({ signal: leadership.signal });
+              void recovery.ready.catch(error => {
+                if (leadership.signal.aborted) return;
+                logger.warn(
+                  `[durable-primary:${cfg.larkAppId}] ingress recovery stopped unexpectedly: `
+                  + `${error instanceof Error ? error.message : String(error)}`,
+                );
+              });
+            },
             onLeadershipLost: () => { eventRuntime.close(); },
+            onSessionLeaseLost: stableKey => {
+              const ds = activeSessions.get(stableKey);
+              if (!ds || ds.larkAppId !== cfg.larkAppId) return;
+              retireWorkerProcessOnly(ds, 'durable_session_lease_lost');
+              if (activeSessions.get(stableKey) === ds) activeSessions.delete(stableKey);
+              try { sessionStore.closeSession(ds.session.sessionId); } catch (error) {
+                logger.error(
+                  `[durable-primary:${cfg.larkAppId}] failed to quarantine local Session `
+                  + `${ds.session.sessionId} after lease loss: `
+                  + `${error instanceof Error ? error.message : String(error)}`,
+                );
+              }
+            },
             onError: error => logger.warn(
               `[durable-primary:${cfg.larkAppId}] `
               + `${error instanceof Error ? error.message : String(error)}`,

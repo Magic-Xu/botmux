@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import {
   drainGrokUpdates,
+  isGrokNarrationInterruption,
   matchGrokPromptAppend,
   discoverGrokSessions,
   findGrokSessionByPid,
@@ -63,6 +64,36 @@ function agentChunk(sessionId: string, text: string, eventId: string, ts = 1_000
       update: {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text },
+        _meta: { eventId, agentTimestampMs: ts },
+      },
+    },
+  };
+}
+
+function hookExecution(sessionId: string, eventName: string, eventId: string, ts = 1_000_180) {
+  return {
+    timestamp: ts,
+    method: '_x.ai/session/update',
+    params: {
+      sessionId,
+      update: {
+        sessionUpdate: 'hook_execution',
+        event_name: eventName,
+        runs: [],
+        _meta: { eventId, agentTimestampMs: ts },
+      },
+    },
+  };
+}
+
+function passiveUpdate(sessionId: string, sessionUpdate: string, eventId: string, ts = 1_000_180) {
+  return {
+    timestamp: ts,
+    method: '_x.ai/session/update',
+    params: {
+      sessionId,
+      update: {
+        sessionUpdate,
         _meta: { eventId, agentTimestampMs: ts },
       },
     },
@@ -175,6 +206,86 @@ describe('drainGrokUpdates', () => {
     const final = drainGrokUpdates(path, next.newOffset, { includePublicActivity: true });
     expect(final.events).toHaveLength(1);
     expect(final.events[0]).toMatchObject({ kind: 'assistant_final', text: 'Done.', terminalStatus: 'completed' });
+  });
+
+  it.each(['stop', 'stop_failure'])('keeps %s final text out of public activity', hook => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'inspect', 'user'), agentChunk(sid, 'Full final answer.', 'answer'),
+      hookExecution(sid, hook, 'hook'), turnDone(sid, 'done'),
+    ]);
+    const result = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    expect(result.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    expect(result.events.at(-1)).toMatchObject({ text: 'Full final answer.', terminalStatus: 'completed' });
+    expect(result.events).toEqual(drainGrokUpdates(path, 0).events);
+    expect(result.newOffset).toBe(statSync(path).size);
+  });
+
+  it('retains final chunks across stop_failure and passive events with public activity enabled', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'inspect', 'user'), agentChunk(sid, 'First part, ', 'a1'),
+      hookExecution(sid, 'stop_failure', 'hook'),
+      passiveUpdate(sid, 'background_tasks', 'background'),
+      passiveUpdate(sid, 'memory_dream_completed', 'memory'),
+      passiveUpdate(sid, 'auto_compact_completed', 'compact'),
+      agentChunk(sid, 'second part.', 'a2'), turnDone(sid, 'done'),
+    ]);
+    const result = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    expect(result.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    expect(result.events.at(-1)).toMatchObject({ text: 'First part, second part.', terminalStatus: 'completed' });
+  });
+
+  it.each(['pre_tool_use', 'post_tool_use', 'post_tool_use_failure', 'session_end'])(
+    'emits interrupted narration once and releases its cursor on %s', hook => {
+      const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+      const path = writeUpdates(sid, '/tmp/proj', [
+        userChunk(sid, 'inspect', 'user'), agentChunk(sid, 'Checking.', 'narration'),
+        hookExecution(sid, hook, 'hook'),
+      ]);
+      const result = drainGrokUpdates(path, 0, { includePublicActivity: true });
+      expect(result.events.map(e => e.kind)).toEqual(['user', 'cot']);
+      expect(result.events[1]).toMatchObject({ sourceSessionId: sid, cotEntries: [{ kind: 'text', text: 'Checking.' }] });
+      expect(result.newOffset).toBe(statSync(path).size);
+      expect(drainGrokUpdates(path, result.newOffset, { includePublicActivity: true }).events).toEqual([]);
+      if (hook !== 'session_end') {
+        appendFileSync(path, JSON.stringify(turnDone(sid, 'done')) + '\n');
+        expect(drainGrokUpdates(path, result.newOffset, { includePublicActivity: true }).events)
+          .toMatchObject([{ kind: 'assistant_final', text: '', terminalStatus: 'completed' }]);
+      }
+    },
+  );
+
+  it('delivers complete narration to the queue once across passive events and partial polls', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'inspect', 'user'), agentChunk(sid, 'Checking ', 'a1'),
+      hookExecution(sid, 'stop', 'stop'),
+    ]);
+    const queue = new CodexBridgeQueue();
+    const narration: string[] = [];
+    queue.setCotObserver(entries => {
+      for (const entry of entries) if (entry.kind === 'text') narration.push(entry.text);
+    });
+    queue.mark('om_test', 'inspect', 100);
+    const first = drainGrokUpdates(path, 0, { includePublicActivity: true });
+    queue.ingest(first.events);
+    expect(first.events.map(e => e.kind)).toEqual(['user']);
+    expect(first.newOffset).toBe(Buffer.byteLength(JSON.stringify(userChunk(sid, 'inspect', 'user')) + '\n'));
+    appendFileSync(path, [
+      passiveUpdate(sid, 'background_tasks', 'background'), agentChunk(sid, 'the project.', 'a2'),
+      hookExecution(sid, 'pre_tool_use', 'pre-tool'), toolCall(sid, 'tool'),
+    ].map(e => JSON.stringify(e)).join('\n') + '\n');
+    const next = drainGrokUpdates(path, first.newOffset, { includePublicActivity: true });
+    queue.ingest(next.events);
+    queue.ingest(next.events);
+    expect(narration).toEqual(['Checking the project.']);
+    expect(queue.drainEmittable()).toEqual([]);
+    appendFileSync(path, [agentChunk(sid, 'Done.', 'final'), hookExecution(sid, 'stop', 'last-stop'), turnDone(sid, 'done')]
+      .map(e => JSON.stringify(e)).join('\n') + '\n');
+    queue.ingest(drainGrokUpdates(path, next.newOffset, { includePublicActivity: true }).events);
+    expect(narration).toEqual(['Checking the project.']);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_test', finalText: 'Done.' }]);
   });
 
   it('preserves failed tool output without converting it into a turn terminal', () => {
@@ -474,6 +585,105 @@ describe('drainGrokUpdates', () => {
     const r2 = drainGrokUpdates(path, r1.newOffset);
     expect(r2.events).toHaveLength(1);
     expect(r2.events[0]).toMatchObject({ kind: 'user', text: 'hello world' });
+  });
+
+  it('preserves final agent text when followed by hook_execution stop before turn_completed', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, '请注册 Agent', 'e1'),
+      agentChunk(sid, '目前还没有你的字节邮箱，请确认。', 'e2'),
+      hookExecution(sid, 'stop', 'e3'),
+      turnDone(sid, 'e4'),
+    ]);
+    const r = drainGrokUpdates(path, 0);
+    const finals = r.events.filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0]!.text).toBe('目前还没有你的字节邮箱，请确认。');
+  });
+
+  it('preserves agent text when hook_execution stop is interleaved between chunks', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'q', 'e1'),
+      agentChunk(sid, '第一部分，', 'e2'),
+      hookExecution(sid, 'stop', 'e3'),
+      agentChunk(sid, '第二部分。', 'e4'),
+      turnDone(sid, 'e5'),
+    ]);
+    const r = drainGrokUpdates(path, 0);
+    const finals = r.events.filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0]!.text).toBe('第一部分，第二部分。');
+  });
+
+  it('drops narration when followed by hook_execution pre_tool_use and tool_call', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'q', 'e1'),
+      agentChunk(sid, '先查一下记录。', 'e2'),
+      hookExecution(sid, 'pre_tool_use', 'e3'),
+      toolCall(sid, 'e4'),
+      agentChunk(sid, '这是最终回复。', 'e5'),
+      hookExecution(sid, 'stop', 'e6'),
+      turnDone(sid, 'e7'),
+    ]);
+    const r = drainGrokUpdates(path, 0);
+    const finals = r.events.filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0]!.text).toBe('这是最终回复。');
+  });
+
+  it('does not drop agent text on passive background updates before turn_completed', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'q', 'e1'),
+      agentChunk(sid, '已处理完成。', 'e2'),
+      passiveUpdate(sid, 'background_tasks', 'e3'),
+      turnDone(sid, 'e4'),
+    ]);
+    const r = drainGrokUpdates(path, 0);
+    const finals = r.events.filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0]!.text).toBe('已处理完成。');
+  });
+
+  it('drops unfinished agent text on session_end and advances offset to avoid pinning', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'q', 'e1'),
+      agentChunk(sid, '未完成的一半回答...', 'e2'),
+      hookExecution(sid, 'session_end', 'e3'),
+    ]);
+    const r = drainGrokUpdates(path, 0);
+    expect(r.events.filter((e) => e.kind === 'assistant_final')).toHaveLength(0);
+    const size = statSync(path).size;
+    expect(r.newOffset).toBe(size);
+  });
+});
+
+describe('isGrokNarrationInterruption', () => {
+  it('returns true for tool calls, thoughts, and plans', () => {
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'tool_call' })).toBe(true);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'tool_call_update' })).toBe(true);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'agent_thought_chunk' })).toBe(true);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'plan' })).toBe(true);
+  });
+
+  it('returns true for tool execution hooks and session_end', () => {
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'pre_tool_use' })).toBe(true);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'post_tool_use' })).toBe(true);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'post_tool_use_failure' })).toBe(true);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'session_end' })).toBe(true);
+  });
+
+  it('returns false for turn lifecycle hooks and passive updates', () => {
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'stop' })).toBe(false);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'stop_failure' })).toBe(false);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'session_start' })).toBe(false);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'hook_execution', event_name: 'user_prompt_submit' })).toBe(false);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'background_tasks' })).toBe(false);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'memory_dream_completed' })).toBe(false);
+    expect(isGrokNarrationInterruption({ sessionUpdate: 'auto_compact_completed' })).toBe(false);
   });
 });
 

@@ -36,6 +36,7 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-riff', LEGACY],
   ['/api/bot-skills', LEGACY],
   ['/api/bot-sandbox-network-policy', LEGACY],
+  ['/api/bot-lark-tool-binding', LEGACY],
 ];
 
 /** [path, 请求体, 期望 status, 期望 body（toMatchObject）, 期望落盘的 config 字段（undefined = 不应出现）] */
@@ -48,7 +49,9 @@ const CASES: readonly Case[] = [
   ['/api/bot-topic-unavailable-policy', '{"topicUnavailablePolicy":"stop"}', 200, { ok: true, topicUnavailablePolicy: 'stop' }, { topicUnavailablePolicy: 'stop' }],
   ['/api/bot-topic-unavailable-policy', '{"topicUnavailablePolicy":"x"}', 400, { ok: false, error: 'invalid_topic_unavailable_policy' }],
   ['/api/bot-topic-unavailable-policy', '[]', 400, { ok: false, error: 'invalid_topic_unavailable_policy' }],
-  ['/api/bot-prompt-injection', '{"promptInjection":"none"}', 200, { ok: true, promptInjection: 'none' }, { promptInjection: 'none' }],
+  // Zero injection forces transcript delivery; the response carries the effective value.
+  ['/api/bot-prompt-injection', '{"promptInjection":"none"}', 200, { ok: true, promptInjection: 'none', replyDelivery: 'transcript' }, { promptInjection: 'none' }],
+  ['/api/bot-prompt-injection', '{"promptInjection":"default"}', 200, { ok: true, promptInjection: 'default', replyDelivery: 'send' }, { promptInjection: 'default' }],
   ['/api/bot-prompt-injection', '{"promptInjection":"x"}', 400, { ok: false, error: 'invalid_prompt_injection' }],
   ['/api/bot-reply-delivery', '{"replyDelivery":"transcript"}', 200, { ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'send' }, { replyDelivery: 'transcript' }],
   ['/api/bot-reply-delivery', '{"replyDelivery":"send"}', 200, { ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' }, { replyDelivery: 'send' }],
@@ -93,6 +96,13 @@ const CASES: readonly Case[] = [
   ['/api/bot-skills', '{"action":"x"}', 400, { ok: false, error: 'invalid_action' }],
   ['/api/bot-skills', '{"action":"attach"}', 400, { ok: false, error: 'name_required' }],
   ['/api/bot-skills', '[]', 400, { ok: false, error: 'bad_json' }],
+  ['/api/bot-lark-tool-binding', '{"enabled":true}', 200, { ok: true, larkToolBinding: true }, { larkToolBinding: undefined }],
+  ['/api/bot-lark-tool-binding', '{"enabled":false}', 200, { ok: true, larkToolBinding: false }, { larkToolBinding: false }],
+  ['/api/bot-lark-tool-binding', '{"larkToolBinding":true}', 200, { ok: true, larkToolBinding: true }, { larkToolBinding: undefined }],
+  ['/api/bot-lark-tool-binding', '{"larkToolBinding":false}', 200, { ok: true, larkToolBinding: false }, { larkToolBinding: false }],
+  ['/api/bot-lark-tool-binding', 'null', 400, { ok: false, error: 'no_valid_fields' }],
+  ['/api/bot-lark-tool-binding', '[]', 400, { ok: false, error: 'no_valid_fields' }],
+  ['/api/bot-lark-tool-binding', '"not_an_object"', 400, { ok: false, error: 'no_valid_fields' }],
 ];
 
 describe('config-field PUT routes (botConfigPutRoute)', () => {

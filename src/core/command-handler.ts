@@ -3,7 +3,7 @@ import { parseGroupCreationArgs, resolveGroupCreationAgents, type GroupCreationA
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
  */
-import { sessionPromptInjection, supportsZeroPromptInjection, type PromptInjection } from './prompt-injection.js';
+import { sessionPromptInjection, supportsZeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
@@ -13,7 +13,7 @@ import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effec
 import { triggerUserAuthApplies } from '../services/trigger-user-auth.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
-import { hasLarkToolBinding } from './lark-tool-binding.js';
+import { isLarkToolBound } from './lark-tool-binding.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
@@ -215,7 +215,7 @@ function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
 }
 
 function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean; sandbox?: boolean | 'off' | 'oncall' | 'scratch' }, cliId: string, promptInjection: PromptInjection): string | undefined {
-  if (promptInjection === 'none' && !supportsZeroPromptInjection(cliId, botCfg)) return 'zero prompt injection requires a CLI with automatic final reply capture';
+  if (promptInjection === 'none' && !supportsZeroPromptInjectionForBot(cliId, botCfg)) return 'zero prompt injection requires a CLI with automatic final reply capture';
   if (cliId === 'riff') return 'Riff requires bot-level backend configuration and cannot be selected per session';
   if (botCfg.env && Object.keys(botCfg.env).length > 0) return 'CLI-selected sessions cannot use bot env';
   if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) return 'CLI-selected sessions cannot use Riff';
@@ -3772,7 +3772,7 @@ export async function handleCommand(
         const loginOpenId = message.senderId;
         // Only sessions created with the new entry use the receiving app here.
         // Existing sessions keep the original login flow below.
-        if (ds && hasLarkToolBinding(config.session.dataDir, ds.session.sessionId)
+        if (ds && isLarkToolBound(botCfg2, config.session.dataDir, ds.session.sessionId)
           && (subCmd === '' || subCmd === 'lark')) {
           const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret,
             normalizeBrand(botCfg2.brand), [], loginOpenId);
@@ -3782,7 +3782,7 @@ export async function handleCommand(
         if (subCmd === 'status' || subCmd === '状态') {
           // Per-person status lines, only for governed tools.
           const lines: string[] = [];
-          if (ds && hasLarkToolBinding(config.session.dataDir, ds.session.sessionId)) {
+          if (ds && isLarkToolBound(botCfg2, config.session.dataDir, ds.session.sessionId)) {
             lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
           } else if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
             lines.push(t(hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no', undefined, loc));
@@ -3812,7 +3812,7 @@ export async function handleCommand(
         // matching side suppressing the other.
         if (subCmd === 'done' || subCmd === '完成') {
           const doneLines: string[] = [];
-          const boundLark = !!ds && hasLarkToolBinding(config.session.dataDir, ds.session.sessionId);
+          const boundLark = !!ds && isLarkToolBound(botCfg2, config.session.dataDir, ds.session.sessionId);
           const larkPending = boundLark ? null : pendingLarkCliChallenge(loginOpenId);
           if (boundLark) {
             doneLines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
@@ -6564,13 +6564,16 @@ export const ADOPT_RESUME_LIMIT = 20;
 
 /** Discover the sessions resumable from disk for `cliId`, excluding any whose
  *  CLI-native id is already live in a botmux session (so a session botmux
- *  already runs isn't offered for re-import). Returns [] when the adapter has
- *  no on-disk store. */
+ *  already runs isn't offered for re-import). `extraExclude` adds more ids to
+ *  skip — the /adopt picker passes the session ids of the live panes it lists,
+ *  so a running session doesn't show up a second time as history. Returns []
+ *  when the adapter has no on-disk store. */
 export async function discoverResumableSessionsForBot(
   cliId: CliId,
   cliPathOverride: string | undefined,
   activeSessions: Map<string, DaemonSession>,
   limit = ADOPT_RESUME_LIMIT,
+  extraExclude?: ReadonlySet<string>,
 ): Promise<ResumableSession[]> {
   let adapter: ReturnType<typeof createCliAdapterSync>;
   try { adapter = createCliAdapterSync(cliId, cliPathOverride); } catch { return []; }
@@ -6588,7 +6591,13 @@ export async function discoverResumableSessionsForBot(
   for (const ds of activeSessions.values()) {
     if (ds.session.sessionId) exclude.add(ds.session.sessionId);
     if (ds.session.cliSessionId) exclude.add(ds.session.cliSessionId);
+    // An in-progress adopt observes an external CLI whose id lives only in
+    // adoptedFrom (a Claude adopt never sets cliSessionId). Hidden only while
+    // the adopt is active: once it ends the session is offered as history again.
+    const adoptedSessionId = ds.adoptedFrom?.sessionId ?? ds.session.adoptedFrom?.sessionId;
+    if (adoptedSessionId) exclude.add(adoptedSessionId);
   }
+  for (const id of extraExclude ?? []) exclude.add(id);
   try {
     return await adapter.listResumableSessions({ limit, exclude });
   } catch {
